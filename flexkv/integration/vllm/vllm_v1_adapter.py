@@ -709,8 +709,28 @@ class FlexKVWorkerConnector:
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Start register kv_caches")
-        gpu_blocks = list(kv_caches.values())
-        num_layer = len(kv_caches)
+
+        # Split kv_caches into main KV cache and sparse attention indexer cache.
+        # In vLLM, DeepSeek V3.2's sparse attention indexer cache layers have
+        # layer names containing ".k_cache" and use uint8 dtype, while main MLA
+        # KV cache layers use the model's default dtype (e.g., bfloat16).
+        main_kv_caches: dict[str, torch.Tensor] = {}
+        indexer_kv_caches: dict[str, torch.Tensor] = {}
+        for layer_name, tensor in kv_caches.items():
+            if ".k_cache" in layer_name:
+                indexer_kv_caches[layer_name] = tensor
+            else:
+                main_kv_caches[layer_name] = tensor
+
+        if indexer_kv_caches:
+            logger.info(
+                f"Detected sparse attention indexer cache: "
+                f"{len(indexer_kv_caches)} indexer layers, "
+                f"{len(main_kv_caches)} main KV cache layers")
+
+        # Build main KV cache layout
+        gpu_blocks = list(main_kv_caches.values())
+        num_layer = len(main_kv_caches)
         if self.flexkv_config.model_config.use_mla:
             assert gpu_blocks[0].ndim == 3, (
                 f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
@@ -734,7 +754,40 @@ class FlexKVWorkerConnector:
             head_size=head_size,
             is_mla=self.flexkv_config.model_config.use_mla,
         )
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+
+        # Build indexer cache layout (if present)
+        indexer_blocks_list = None
+        indexer_layout = None
+        indexer_dtype = None
+        if indexer_kv_caches:
+            indexer_blocks_list = list(indexer_kv_caches.values())
+            indexer_tensor = indexer_blocks_list[0]
+            assert indexer_tensor.ndim == 3, (
+                f"expect indexer cache tensor has 3 dim but get shape={indexer_tensor.shape}.")
+            indexer_num_blocks = indexer_tensor.shape[0]
+            indexer_block_size = indexer_tensor.shape[1]
+            indexer_head_size = indexer_tensor.shape[2]
+            indexer_dtype = indexer_tensor.dtype
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(indexer_kv_caches),
+                num_block=indexer_num_blocks,
+                tokens_per_block=indexer_block_size,
+                num_head=1,
+                head_size=indexer_head_size,
+                is_mla=True,  # indexer cache is MLA-style (no K/V split)
+            )
+            logger.info(
+                f"Indexer cache layout: num_layer={len(indexer_kv_caches)}, "
+                f"num_blocks={indexer_num_blocks}, block_size={indexer_block_size}, "
+                f"head_size={indexer_head_size}, dtype={indexer_dtype}")
+
+        self.tp_client.register_to_server(
+            gpu_blocks, gpu_layout,
+            indexer_caches=indexer_blocks_list,
+            indexer_layout=indexer_layout,
+            indexer_dtype=indexer_dtype,
+        )
         logger.info("Finish register kv_caches")
 
     def __del__(self):

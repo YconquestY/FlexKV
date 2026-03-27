@@ -37,6 +37,11 @@ class DeviceType(IntEnum):
     REMOTE = 3
     PEERCPU = 4
     PEERSSD = 5
+    # Sparse attention indexer cache (e.g., DeepSeek V3.2 DSA k_cache)
+    GPU_INDEXER = 6
+    CPU_INDEXER = 7
+    SSD_INDEXER = 8
+    REMOTE_INDEXER = 9
 
 class TransferType(Enum):
     H2D    = "H2D"

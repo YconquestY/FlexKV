@@ -1,9 +1,12 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from flexkv.common.config import ModelConfig
+
+if TYPE_CHECKING:
+    import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus
@@ -22,6 +25,10 @@ class RegisterTPClientRequest:
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
+    # Optional sparse attention indexer cache (e.g., DeepSeek V3.2 DSA)
+    indexer_handles: Optional[List[TensorSharedHandle]] = None
+    indexer_layout: Optional[KVCacheLayout] = None
+    indexer_dtype: Optional['torch.dtype'] = None
 
 @dataclass
 class IsReadyRequest:

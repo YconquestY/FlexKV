@@ -428,6 +428,42 @@ def test_tensor_dtype_string_mapping():
         ), f"String '{dtype_str}' should map to {expected_dtype}"
 
 
+def _worker_test_fp8_tensor_from_bytes(conn, device_id):
+    """Test construction from bytes (IPC handle) with fp8 dtype"""
+    try:
+        # Receive TensorSharedHandle
+        handle = conn.recv()
+        assert isinstance(handle, TensorSharedHandle)
+        assert handle.use_direct_ipc, "Construction from bytes should use direct CUDA IPC"
+        assert handle.ipc_handle is not None, "Should have ipc_handle"
+        assert handle.tensor_shape == (10, 20), "tensor shape should be saved"
+        assert handle.tensor_dtype == torch.float8_e4m3fn, "tensor dtype should be fp8"
+        assert (
+            handle.rebuild_func is None
+        ), "Construction from bytes should not have rebuild_func"
+
+        # Recover tensor
+        tensor = handle.get_tensor()
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.is_cuda, "tensor should be on CUDA"
+        assert (
+            tensor.device.index == device_id
+        ), f"tensor should be on device {device_id}"
+        assert tensor.shape == (10, 20), "tensor shape should be correct"
+        assert tensor.dtype == torch.float8_e4m3fn, "tensor dtype should be fp8"
+
+        # Verify data: compare via int8 view since fp8 doesn't support arithmetic ops
+        expected_base = torch.arange(200, dtype=torch.float32).reshape(10, 20).cuda(device_id)
+        expected_fp8 = expected_base.to(torch.float8_e4m3fn)
+        max_diff = int(
+            (tensor.view(torch.int8) - expected_fp8.view(torch.int8)).abs().max().item()
+        )
+        conn.send(max_diff)
+    except Exception as e:
+        conn.send(f"Error: {e}")
+        raise
+
+
 def _worker_modify_tensor(conn, handle):
     """Worker process: modify shared tensor"""
     tensor = handle.get_tensor()
@@ -509,3 +545,8 @@ def test_fp8_tensor_from_bytes_roundtrip():
 
     process.join(timeout=5)
     parent_conn.close()
+    child_conn.close()
+    # Explicitly release CUDA IPC resources before process exits to avoid
+    # "Producer process terminated before shared CUDA tensors released" warning
+    del handle, source_handle, original_tensor, base
+    torch.cuda.synchronize(device_id)

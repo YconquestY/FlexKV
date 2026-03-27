@@ -254,6 +254,9 @@ class KVTPClient:
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
+        indexer_caches: Optional[List[torch.Tensor]] = None,
+        indexer_layout: Optional[KVCacheLayout] = None,
+        indexer_dtype: Optional[torch.dtype] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -266,11 +269,27 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
+        # Build indexer handles if sparse attention indexer cache is provided
+        indexer_handles = None
+        if indexer_caches is not None and indexer_layout is not None:
+            indexer_handles = []
+            for tensor in indexer_caches:
+                handle = TensorSharedHandle(tensor, device_id)
+                indexer_handles.append(handle)
+            flexkv_logger.info(
+                f"Registering sparse attention indexer cache: "
+                f"num_layers={len(indexer_caches)}, "
+                f"shape={indexer_caches[0].shape}, "
+                f"dtype={indexer_dtype}")
+
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
             device_id,
             handles,
-            kv_layout
+            kv_layout,
+            indexer_handles=indexer_handles,
+            indexer_layout=indexer_layout,
+            indexer_dtype=indexer_dtype,
         )
 
         self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)

@@ -17,6 +17,7 @@ import textwrap
 import subprocess
 import pickle
 import sys
+import torch
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
@@ -49,6 +50,11 @@ class TransferManager:
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
 
+        # Sparse attention indexer cache (e.g., DeepSeek V3.2 DSA k_cache)
+        self.all_indexer_layouts: Dict[int, KVCacheLayout] = {}
+        self.all_indexer_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_blocks
+        self.all_indexer_dtypes: Dict[int, Any] = {}  # device_id -> indexer dtype
+
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
             self.context, zmq.SocketType.PULL, gpu_register_port, True)
@@ -68,6 +74,16 @@ class TransferManager:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
                 self.gpu_client_mapping[device_id] = req.dp_client_id
+                # Handle sparse attention indexer cache registration
+                if req.indexer_handles is not None and req.indexer_layout is not None:
+                    self.all_indexer_blocks[device_id] = req.indexer_handles
+                    self.all_indexer_layouts[device_id] = req.indexer_layout
+                    self.all_indexer_dtypes[device_id] = req.indexer_dtype
+                    flexkv_logger.info(
+                        f"GPU {device_id} registered with sparse attention indexer cache: "
+                        f"num_layers={req.indexer_layout.num_layer}, "
+                        f"head_size={req.indexer_layout.head_size}, "
+                        f"dtype={req.indexer_dtype}")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -113,12 +129,26 @@ class TransferManager:
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
         
-        # Register GPU blocks with their global device IDs
+        # Register main GPU KV cache blocks
         for device_id, gpu_blocks_wrapper in self.all_gpu_blocks.items():
             self.storage_engine.register_gpu_blocks(gpu_blocks_wrapper,
                                                     self.all_gpu_layouts[device_id],
                                                     device_id,
                                                     dtype=self.model_config.dtype)
+        
+        # Register sparse attention indexer cache blocks (if present)
+        has_indexer = len(self.all_indexer_blocks) > 0
+        if has_indexer:
+            for device_id, indexer_blocks_wrapper in self.all_indexer_blocks.items():
+                indexer_dtype = self.all_indexer_dtypes.get(device_id, torch.uint8)
+                self.storage_engine.register_indexer_blocks(
+                    indexer_blocks_wrapper,
+                    self.all_indexer_layouts[device_id],
+                    device_id,
+                    dtype=indexer_dtype)
+            flexkv_logger.info(
+                f"Registered sparse attention indexer cache for "
+                f"{len(self.all_indexer_blocks)} GPUs")
         
         # Group GPU handles by dp_client_id
         grouped_gpu_handles: Dict[int, List] = {}
@@ -128,6 +158,17 @@ class TransferManager:
                 grouped_gpu_handles[dp_client_id] = []
             grouped_gpu_handles[dp_client_id].append(
                 self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
+
+        # Group indexer GPU handles by dp_client_id (if present)
+        grouped_indexer_handles: Optional[Dict[int, List]] = None
+        if has_indexer:
+            grouped_indexer_handles = {}
+            for device_id in sorted(self.all_indexer_blocks.keys()):
+                dp_client_id = self.gpu_client_mapping[device_id]
+                if dp_client_id not in grouped_indexer_handles:
+                    grouped_indexer_handles[dp_client_id] = []
+                grouped_indexer_handles[dp_client_id].append(
+                    self.storage_engine.get_storage_handle(DeviceType.GPU_INDEXER, device_id))
         
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
@@ -138,12 +179,38 @@ class TransferManager:
             if self.cache_config.enable_remote \
             else None
         )
+
+        # Get indexer CPU handle if available
+        indexer_cpu_handle = None
+        if has_indexer and self.cache_config.enable_cpu:
+            indexer_cpu_handle = self.storage_engine.get_storage_handle(
+                DeviceType.CPU_INDEXER) if self.storage_engine.has_storage_handle(
+                DeviceType.CPU_INDEXER) else None
+
+        # Get indexer SSD handle if available
+        indexer_ssd_handle = None
+        if has_indexer and self.cache_config.enable_ssd:
+            indexer_ssd_handle = self.storage_engine.get_storage_handle(
+                DeviceType.SSD_INDEXER) if self.storage_engine.has_storage_handle(
+                DeviceType.SSD_INDEXER) else None
+
+        # Get indexer Remote handle if available
+        indexer_remote_handle = None
+        if has_indexer and self.cache_config.enable_remote:
+            indexer_remote_handle = self.storage_engine.get_storage_handle(
+                DeviceType.REMOTE_INDEXER) if self.storage_engine.has_storage_handle(
+                DeviceType.REMOTE_INDEXER) else None
+
         self.transfer_engine = TransferEngine(gpu_handles=grouped_gpu_handles,
                                               model_config=self.model_config,
                                               cache_config=self.cache_config,
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
-                                              remote_handle=remote_handle)
+                                              remote_handle=remote_handle,
+                                              indexer_gpu_handles=grouped_indexer_handles,
+                                              indexer_cpu_handle=indexer_cpu_handle,
+                                              indexer_ssd_handle=indexer_ssd_handle,
+                                              indexer_remote_handle=indexer_remote_handle)
         flexkv_logger.info("Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:

@@ -145,10 +145,28 @@ index 4b3315560..d098dd48b 100644
      def _maybe_init_kv_connector_manager(self):
          if self.kv_connector_manager is not None:
              if self.kv_cache_transceiver is not None:
-@@ -309,6 +311,15 @@ class PyExecutor:
+@@ -309,6 +311,32 @@ class PyExecutor:
                          self.kv_connector_manager.layer_pre_hook)
                      module.register_forward_hook(
                          self.kv_connector_manager.layer_post_hook)
++
++            # Register sparse attention indexer KV cache if the worker supports it
++            # and the KV cache manager has indexer data available.
++            if hasattr(self.kv_connector_manager.worker, 'register_indexer_kv_caches') and \
++               hasattr(self.kv_cache_manager, 'get_indexer_k_cache_pool_data'):
++                try:
++                    # Probe layer 0 to check if indexer k_cache pool exists
++                    probe = self.kv_cache_manager.get_indexer_k_cache_pool_data(0)
++                    if probe is not None and probe.numel() > 0:
++                        self.kv_connector_manager.worker.register_indexer_kv_caches(
++                            self.kv_cache_manager)
++                        logger.info("Registered sparse attention indexer KV caches")
++                except Exception as e:
++                    logger.debug(f"No indexer k_cache pool available (expected for non-DSA models): {e}")
++
++            # Flush deferred registration (sends main + indexer caches in a single request)
++            if hasattr(self.kv_connector_manager.worker, 'flush_registration'):
++                self.kv_connector_manager.worker.flush_registration()
 +            
 +            if self.use_flexkv:
 +                self._wait_for_flexkv_manager()

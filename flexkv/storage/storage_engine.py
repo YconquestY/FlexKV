@@ -87,6 +87,74 @@ class StorageEngine:
             raw_data=gpu_blocks
         )
 
+    def register_indexer_blocks(self,
+                                indexer_blocks: List[TensorSharedHandle],
+                                indexer_layout: KVCacheLayout,
+                                device_id: int = 0,
+                                dtype: torch.dtype = torch.uint8) -> None:
+        self.allocate(
+            device_type=DeviceType.GPU_INDEXER,
+            layout=indexer_layout,
+            dtype=dtype,
+            device_id=device_id,
+            raw_data=indexer_blocks
+        )
+
+        if self._cache_config.enable_cpu:
+            cpu_indexer_layout = KVCacheLayout(
+                type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
+                num_layer=indexer_layout.num_layer,
+                num_block=self._cache_config.num_cpu_blocks,
+                tokens_per_block=indexer_layout.tokens_per_block,
+                num_head=indexer_layout.num_head,
+                head_size=indexer_layout.head_size,
+                is_mla=indexer_layout.is_mla,
+            )
+            if not self.has_storage_handle(DeviceType.CPU_INDEXER):
+                self.allocate(
+                    device_type=DeviceType.CPU_INDEXER,
+                    layout=cpu_indexer_layout,
+                    dtype=dtype,
+                )
+
+        if self._cache_config.enable_ssd:
+            ssd_indexer_layout = KVCacheLayout(
+                type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
+                num_layer=indexer_layout.num_layer,
+                num_block=self._cache_config.num_ssd_blocks,
+                tokens_per_block=indexer_layout.tokens_per_block,
+                num_head=indexer_layout.num_head,
+                head_size=indexer_layout.head_size,
+                is_mla=indexer_layout.is_mla,
+            )
+            if not self.has_storage_handle(DeviceType.SSD_INDEXER):
+                self.allocate(
+                    device_type=DeviceType.SSD_INDEXER,
+                    layout=ssd_indexer_layout,
+                    dtype=dtype,
+                    cache_dir=self._cache_config.ssd_cache_dir,
+                    max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+                )
+
+        if self._cache_config.enable_remote:
+            remote_indexer_layout = KVCacheLayout(
+                type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
+                num_layer=indexer_layout.num_layer,
+                num_block=self._cache_config.num_remote_blocks,
+                tokens_per_block=indexer_layout.tokens_per_block,
+                num_head=indexer_layout.num_head,
+                head_size=indexer_layout.head_size,
+                is_mla=indexer_layout.is_mla,
+            )
+            if not self.has_storage_handle(DeviceType.REMOTE_INDEXER):
+                self.allocate(
+                    device_type=DeviceType.REMOTE_INDEXER,
+                    layout=remote_indexer_layout,
+                    dtype=dtype,
+                    file_path=self._cache_config.remote_cache_path,
+                    remote_config_custom=self._cache_config.remote_config_custom,
+                )
+
     def allocate(self,
                  device_type: DeviceType,
                  layout: KVCacheLayout,
@@ -114,7 +182,7 @@ class StorageEngine:
             return False
 
         storage_handle: StorageHandle
-        if device_type == DeviceType.CPU:
+        if device_type in (DeviceType.CPU, DeviceType.CPU_INDEXER):
             pin_memory = kwargs.get('pin_memory', False)
             if raw_data is not None:
                 assert isinstance(raw_data, torch.Tensor), \
@@ -131,13 +199,13 @@ class StorageEngine:
                     dtype=dtype,
                     pin_memory=pin_memory
                 )
-        elif device_type == DeviceType.GPU:
+        elif device_type in (DeviceType.GPU, DeviceType.GPU_INDEXER):
             num_chunks = kwargs.get('num_chunks', 1)
             if raw_data is not None:
                 assert isinstance(raw_data, list) and \
                     (all(isinstance(x, TensorSharedHandle) for x in raw_data) or \
                      all(isinstance(x, torch.Tensor) for x in raw_data)), \
-                    "raw_data for GPUAllocator must be List[TensorWrapper] or List[Tensor]"
+                    f"raw_data for GPUAllocator must be List[TensorSharedHandle] or List[Tensor]"
                 storage_handle = GPUAllocator.from_raw_data(
                     data=raw_data,  # type: ignore
                     layout=layout,
@@ -151,7 +219,7 @@ class StorageEngine:
                     num_chunks=num_chunks,
                     device_id=device_id
                 )
-        elif device_type == DeviceType.SSD:
+        elif device_type in (DeviceType.SSD, DeviceType.SSD_INDEXER):
             cache_dir = kwargs.get('cache_dir')
             max_file_size_gb = kwargs.get('max_file_size_gb', -1)
             if raw_data is not None:
@@ -169,7 +237,8 @@ class StorageEngine:
                 server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
                 hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
                 rand_suffix = f"{hash_value[:6]}"
-                file_prefix = f"flexkv_ssdcache_{rand_suffix}"
+                cache_prefix = "flexkv_ssdcache_indexer" if device_type == DeviceType.SSD_INDEXER else "flexkv_ssdcache"
+                file_prefix = f"{cache_prefix}_{rand_suffix}"
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
@@ -177,7 +246,7 @@ class StorageEngine:
                     file_prefix=file_prefix,
                     max_file_size_gb=max_file_size_gb
                 )
-        elif device_type == DeviceType.REMOTE:
+        elif device_type in (DeviceType.REMOTE, DeviceType.REMOTE_INDEXER):
             file_path = kwargs.get('file_path')
             remote_config_custom = kwargs.get('remote_config_custom')
             if raw_data is not None:

@@ -87,7 +87,11 @@ class TransferEngine:
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
-        remote_handle: Optional[StorageHandle] = None):
+        remote_handle: Optional[StorageHandle] = None,
+        indexer_gpu_handles: Optional[Dict[int, List[StorageHandle]]] = None,
+        indexer_cpu_handle: Optional[StorageHandle] = None,
+        indexer_ssd_handle: Optional[StorageHandle] = None,
+        indexer_remote_handle: Optional[StorageHandle] = None):
         """
         Initialize transfer engine
 
@@ -96,6 +100,10 @@ class TransferEngine:
             cpu_handle: CPU handle
             ssd_handle: Optional SSD handle
             remote_handle: Optional remote handle
+            indexer_gpu_handles: Optional dict mapping dp_client_id -> list of GPU indexer handles
+            indexer_cpu_handle: Optional CPU indexer handle
+            indexer_ssd_handle: Optional SSD indexer handle
+            indexer_remote_handle: Optional remote indexer handle
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
@@ -111,6 +119,7 @@ class TransferEngine:
         self.completed_queue = self.mp_ctx.Queue()
         self.finished_ops_queue = self.mp_ctx.Queue()
         self.op_id_to_op: Dict[int, TransferOp] = {}
+        self.op_id_to_indexer_op: Dict[int, TransferOp] = {}
 
         # Create shutdown pipe for zero-latency selector
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
@@ -121,6 +130,23 @@ class TransferEngine:
         self._cache_config = cache_config
         self._enable_pcfs_sharing = GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing # TODO: is this correct?
 
+        # Sparse attention indexer cache handles
+        self._indexer_gpu_handles = indexer_gpu_handles
+        self._indexer_cpu_handle = indexer_cpu_handle
+        self._indexer_ssd_handle = indexer_ssd_handle
+        self._indexer_remote_handle = indexer_remote_handle
+        self._has_indexer = indexer_gpu_handles is not None and len(indexer_gpu_handles) > 0
+
+        # Separate finished queue for indexer workers to avoid double-counting in scheduler
+        self.indexer_finished_ops_queue = self.mp_ctx.Queue() if self._has_indexer else None
+
+        # Initialize indexer workers list (populated in _init_workers)
+        self.indexer_gpucpu_workers: List[WorkerHandle] = []
+        self.indexer_cpussd_read_worker: Optional[WorkerHandle] = None
+        self.indexer_cpussd_write_worker: Optional[WorkerHandle] = None
+        self.indexer_remotecpu_read_worker: Optional[WorkerHandle] = None
+        self.indexer_remotecpu_write_worker: Optional[WorkerHandle] = None
+
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
@@ -130,6 +156,53 @@ class TransferEngine:
         self.num_gpu_groups = len(self.gpu_handles)
         self._running = False
 
+    def _create_gpucpu_workers(
+        self,
+        gpu_handles_map: Dict[int, List[StorageHandle]],
+        cpu_handle: StorageHandle,
+        finished_ops_queue,
+    ) -> List[WorkerHandle]:
+        """Create GPU-CPU transfer workers for a given set of GPU and CPU handles."""
+        if self.tp_size == 1:
+            return [
+                GPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
+                    cpu_blocks=cpu_handle.get_tensor(),
+                    gpu_kv_layout=gpu_handles[0].kv_layout,
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                )
+                for _, gpu_handles in gpu_handles_map.items()
+            ]
+        else:
+            return [
+                tpGPUCPUTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+                    cpu_blocks=cpu_handle.get_tensor(),
+                    gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
+                    cpu_kv_layout=cpu_handle.kv_layout,
+                    dtype=gpu_handles[0].dtype,
+                    tp_group_size=self.tp_size,
+                    dp_group_id=dp_client_id,
+                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                )
+                for dp_client_id, gpu_handles in gpu_handles_map.items()
+            ]
+
     def _init_workers(self) -> None:
         if self._running:
             return
@@ -138,84 +211,78 @@ class TransferEngine:
         assert self._cpu_handle is not None
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
-        if self.tp_size == 1:
-            self.h2d_workers: List[WorkerHandle] = [
-                GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for _, gpu_handles in self.gpu_handles.items()
-            ]
-            self.d2h_workers: List[WorkerHandle] = [
-                GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for _, gpu_handles in self.gpu_handles.items()
-            ]
-        else:
-            self.h2d_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=dp_client_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
-            ]
-            self.d2h_workers = [
-                tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.tp_size,
-                    dp_group_id=dp_client_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                )
-                for dp_client_id, gpu_handles in self.gpu_handles.items()
-            ]
+        self.h2d_workers: List[WorkerHandle] = self._create_gpucpu_workers(
+            self.gpu_handles, self._cpu_handle, self.finished_ops_queue)
+        self.d2h_workers: List[WorkerHandle] = self._create_gpucpu_workers(
+            self.gpu_handles, self._cpu_handle, self.finished_ops_queue)
         self._worker_map[TransferType.H2D] = self.h2d_workers
         self._worker_map[TransferType.D2H] = self.d2h_workers
+
+        # Create indexer GPU-CPU transfer workers for sparse attention indexer cache
+        if self._has_indexer and self._indexer_cpu_handle is not None:
+            self.indexer_gpucpu_workers: List[WorkerHandle] = self._create_gpucpu_workers(
+                self._indexer_gpu_handles, self._indexer_cpu_handle,
+                self.indexer_finished_ops_queue)
+            flexkv_logger.info(
+                f"Created {len(self.indexer_gpucpu_workers)} indexer GPU-CPU transfer workers "
+                f"for sparse attention indexer cache")
+        else:
+            self.indexer_gpucpu_workers = []
+
+        # Create indexer CPU-SSD transfer workers
+        if self._has_indexer and self._indexer_ssd_handle is not None and self._indexer_cpu_handle is not None:
+            self.indexer_cpussd_read_worker = CPUSSDDiskTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.indexer_finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                ssd_files=self._indexer_ssd_handle.get_file_list(),
+                cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
+                dtype=self._indexer_cpu_handle.dtype,
+                num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
+                cache_config=self._cache_config,
+            )
+            self.indexer_cpussd_write_worker = CPUSSDDiskTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.indexer_finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                ssd_files=self._indexer_ssd_handle.get_file_list(),
+                cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                ssd_kv_layout=self._indexer_ssd_handle.kv_layout,
+                dtype=self._indexer_cpu_handle.dtype,
+                num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file,
+                cache_config=self._cache_config,
+            )
+            flexkv_logger.info("Created indexer CPU-SSD transfer workers for sparse attention indexer cache")
+
+        # Create indexer CPU-Remote transfer workers
+        if self._has_indexer and self._indexer_remote_handle is not None and self._indexer_cpu_handle is not None:
+            self.indexer_remotecpu_read_worker = CPURemoteTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.indexer_finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                remote_file=self._indexer_remote_handle.get_file_list(),
+                cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                remote_kv_layout=self._indexer_remote_handle.kv_layout,
+                dtype=self._indexer_cpu_handle.dtype,
+                remote_config_custom=self._indexer_remote_handle.remote_config_custom,
+                enable_pcfs_sharing=self._enable_pcfs_sharing,
+            )
+            self.indexer_remotecpu_write_worker = CPURemoteTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.indexer_finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._indexer_cpu_handle.get_tensor(),
+                remote_file=self._indexer_remote_handle.get_file_list(),
+                cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                remote_kv_layout=self._indexer_remote_handle.kv_layout,
+                dtype=self._indexer_cpu_handle.dtype,
+                remote_config_custom=self._indexer_remote_handle.remote_config_custom,
+            )
+            flexkv_logger.info("Created indexer CPU-Remote transfer workers for sparse attention indexer cache")
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
@@ -347,6 +414,17 @@ class TransferEngine:
                 flexkv_logger.info(f"waiting for {transfer_type.name} worker {worker.worker_id} to ready")
                 worker.ready_event.wait()
                 flexkv_logger.info(f"{transfer_type.name} worker {worker.worker_id} is ready")
+        # Wait for indexer workers to ready
+        for w in self.indexer_gpucpu_workers:
+            flexkv_logger.info(f"waiting for indexer worker {w.worker_id} to ready")
+            w.ready_event.wait()
+            flexkv_logger.info(f"indexer worker {w.worker_id} is ready")
+        for w in [self.indexer_cpussd_read_worker, self.indexer_cpussd_write_worker,
+                  self.indexer_remotecpu_read_worker, self.indexer_remotecpu_write_worker]:
+            if w is not None:
+                flexkv_logger.info(f"waiting for indexer worker {w.worker_id} to ready")
+                w.ready_event.wait()
+                flexkv_logger.info(f"indexer worker {w.worker_id} is ready")
         # Start scheduler thread
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
@@ -368,6 +446,11 @@ class TransferEngine:
 
         # Register shutdown pipe for zero-latency shutdown
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
+
+        # Register indexer finished queue if present (just drain, don't act on)
+        if self.indexer_finished_ops_queue is not None:
+            sel.register(self.indexer_finished_ops_queue._reader,
+                        selectors.EVENT_READ, data="indexer_finished")
 
         flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
 
@@ -431,6 +514,17 @@ class TransferEngine:
                                 break
                         nvtx.end_range(nvtx_r2)
 
+                    elif key.data == "indexer_finished":
+                        # Release pin_buffer slots held for indexer workers
+                        while True:
+                            try:
+                                op_id = self.indexer_finished_ops_queue.get_nowait()
+                                if op_id in self.op_id_to_indexer_op:
+                                    indexer_op = self.op_id_to_indexer_op.pop(op_id)
+                                    free_op_from_buffer(indexer_op, self.pin_buffer)
+                            except queue.Empty:
+                                break
+
                 # Exit loop if shutdown requested
                 if should_shutdown:
                     break
@@ -483,6 +577,49 @@ class TransferEngine:
             worker[op.dp_id].submit_transfer(op)
         else:
             worker.submit_transfer(op)
+
+        if self._has_indexer and self.indexer_gpucpu_workers and \
+                op.transfer_type in (TransferType.H2D, TransferType.D2H):
+            if op.dp_id < len(self.indexer_gpucpu_workers):
+                with self.pin_buffer.lock:
+                    if op.src_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.src_slot_id] += 1
+                    if op.dst_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.dst_slot_id] += 1
+                self.op_id_to_indexer_op[op.op_id] = op
+                self.indexer_gpucpu_workers[op.dp_id].submit_transfer(op)
+            else:
+                flexkv_logger.warning(
+                    f"indexer worker index out of range: dp_id={op.dp_id}, "
+                    f"num_indexer_workers={len(self.indexer_gpucpu_workers)}")
+
+        if self._has_indexer and op.transfer_type in (TransferType.H2DISK, TransferType.DISK2H):
+            indexer_worker = (
+                self.indexer_cpussd_write_worker if op.transfer_type == TransferType.H2DISK
+                else self.indexer_cpussd_read_worker
+            )
+            if indexer_worker is not None:
+                with self.pin_buffer.lock:
+                    if op.src_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.src_slot_id] += 1
+                    if op.dst_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.dst_slot_id] += 1
+                self.op_id_to_indexer_op[op.op_id] = op
+                indexer_worker.submit_transfer(op)
+
+        if self._has_indexer and op.transfer_type in (TransferType.H2REMOTE, TransferType.REMOTE2H):
+            indexer_worker = (
+                self.indexer_remotecpu_write_worker if op.transfer_type == TransferType.H2REMOTE
+                else self.indexer_remotecpu_read_worker
+            )
+            if indexer_worker is not None:
+                with self.pin_buffer.lock:
+                    if op.src_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.src_slot_id] += 1
+                    if op.dst_slot_id != -1:
+                        self.pin_buffer.slot_ref_count[op.dst_slot_id] += 1
+                self.op_id_to_indexer_op[op.op_id] = op
+                indexer_worker.submit_transfer(op)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
@@ -553,12 +690,23 @@ class TransferEngine:
                         w.shutdown()
                 else:
                     worker.shutdown()
+            # shutdown indexer workers
+            for w in self.indexer_gpucpu_workers:
+                w.shutdown()
+            for w in [self.indexer_cpussd_read_worker, self.indexer_cpussd_write_worker,
+                      self.indexer_remotecpu_read_worker, self.indexer_remotecpu_write_worker]:
+                if w is not None:
+                    w.shutdown()
         except Exception as e:
             flexkv_logger.error(f"Error during shutdown: {e}")
         finally:
             with contextlib.suppress(Exception):
                 while not self.finished_ops_queue.empty():
                     self.finished_ops_queue.get_nowait()
+            if self.indexer_finished_ops_queue is not None:
+                with contextlib.suppress(Exception):
+                    while not self.indexer_finished_ops_queue.empty():
+                        self.indexer_finished_ops_queue.get_nowait()
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

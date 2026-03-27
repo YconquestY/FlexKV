@@ -565,27 +565,24 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             flexkv_logger.error(traceback.format_exc())
             raise e
 
-    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
-        # vllm kv_caches: dict[str, torch.Tensor]
-        # trt kv_caches: torch.Tensor
+    def _get_physical_device_id(self, tensor: torch.Tensor) -> int:
+        """Get physical GPU device ID from a CUDA tensor.
         
-        # shepe = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        # 1. mNumPrimaryBlocks{blocksInPrimaryPool}            blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
-        # 2. layer_num
-        # 3. mKVFactor{mCacheType == CacheType::kSELFKONLY ? 1 : 2}
-        # 4. blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
-    
-        flexkv_logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
+        In MPI environments, CUDA_VISIBLE_DEVICES may remap logical device IDs.
+        This method resolves the logical ID from the tensor to the physical GPU ID.
         
-        # Get actual device from tensor (more reliable in MPI environment)
-        logical_device_id = kv_cache_tensor.device.index
-        flexkv_logger.debug(f"Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
+        Args:
+            tensor: A CUDA tensor to get the device ID from.
+            
+        Returns:
+            int: The physical GPU device ID.
+        """
+        logical_device_id = tensor.device.index
+        flexkv_logger.debug(f"Tensor is on device: {tensor.device}, logical device.index={logical_device_id}")
         flexkv_logger.debug(f"self.tp_client.device_id (from init): {self.tp_client.device_id}")
         
-        # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
         cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
         if cuda_visible_devices:
-            # Map logical ID to physical ID
             visible_gpus = [int(x) for x in cuda_visible_devices.split(',')]
             physical_device_id = visible_gpus[logical_device_id] if logical_device_id < len(visible_gpus) else logical_device_id
             flexkv_logger.debug(f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
@@ -593,23 +590,59 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             physical_device_id = logical_device_id
             flexkv_logger.debug(f"No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
         
-        # Use physical device ID for registration
-        correct_device_id = physical_device_id
+        return physical_device_id
+
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        """Register the primary KV cache tensor from TensorRT-LLM.
         
-        if self.flexkv_config.model_config.use_mla:
-            assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
+        TRT-LLM stores KV cache as a single contiguous 4D tensor:
+            shape = [num_blocks, num_layers, kv_factor, block_size_dim]
+        where:
+            - num_blocks: number of cache blocks in the primary pool
+            - num_layers: number of transformer layers
+            - kv_factor: 1 for MLA (SELFKONLY), 2 for standard (K+V)
+            - block_size_dim: (num_kv_heads * head_size * tokens_per_block) / quant_size
+        
+        Unlike vLLM which provides per-layer tensors (LAYERFIRST), TRT-LLM provides
+        a single contiguous tensor in BLOCKFIRST layout. Both layouts are natively
+        supported by FlexKV's transfer worker through stride-based addressing:
+        
+            vLLM:    List[Tensor] per-layer  + LAYERFIRST  -> gpu_block_type=0
+            TRT-LLM: [single_tensor]         + BLOCKFIRST  -> gpu_block_type=1
+        
+        Each adapter preserves its engine's native memory layout (zero-copy),
+        and FlexKV's transfer kernel uses the layout's stride values to correctly
+        address blocks regardless of the physical memory ordering.
+        
+        Indexer cache (if any) is registered separately via register_indexer_kv_caches().
+        
+        Args:
+            kv_cache_tensor: The contiguous KV cache tensor from TRT-LLM.
+                shape = [num_blocks, num_layers, kv_factor, block_size_dim]
+        """
+        flexkv_logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
+        
+        correct_device_id = self._get_physical_device_id(kv_cache_tensor)
+        self._correct_device_id = correct_device_id
+        
+        assert kv_cache_tensor.ndim == 4, (
+            f"expect kv cache tensor has 4 dims but got shape={kv_cache_tensor.shape}")
 
         num_blocks = kv_cache_tensor.shape[0]
         num_layers = kv_cache_tensor.shape[1]
-        kv_dim = kv_cache_tensor.shape[2]
+        kv_factor = kv_cache_tensor.shape[2]
         block_size = self.flexkv_config.cache_config.tokens_per_block
         num_kv_heads = 1 if self.flexkv_config.model_config.use_mla else self.flexkv_config.model_config.num_kv_heads
         head_size = self.flexkv_config.model_config.head_size
-        if self.flexkv_config.model_config.use_mla:
-            assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
         
-        gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
- 
+        if self.flexkv_config.model_config.use_mla:
+            assert kv_factor == 1, f"expect kv_factor=1 for MLA but got {kv_factor}"
+        
+        # Preserve TRT-LLM's native contiguous tensor as-is (zero-copy).
+        # Use BLOCKFIRST layout so FlexKV's transfer worker computes correct
+        # strides for [num_blocks, num_layers, kv_factor, block_size_dim].
+        gpu_blocks = [kv_cache_tensor]
+
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.BLOCKFIRST,
             num_layer=num_layers,
@@ -620,9 +653,117 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             is_mla=self.flexkv_config.model_config.use_mla,
         )
         flexkv_logger.info(f"gpu_layout: {gpu_layout}")
-        # Use correct device_id from tensor's actual device
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)
-        flexkv_logger.info(f"Finish register kv_caches on device {correct_device_id}")
+        
+        # Store pending state for deferred registration.
+        # Registration is deferred to flush_registration() so that indexer cache
+        # (if available) can be included in a single atomic registration call.
+        self._pending_gpu_blocks = gpu_blocks
+        self._pending_gpu_layout = gpu_layout
+        flexkv_logger.info(f"KV caches prepared, waiting for flush_registration")
+
+    def register_indexer_kv_caches(self, kv_cache_manager) -> None:
+        """Collect sparse attention indexer KV cache from TRT-LLM's KVCacheManager.
+        
+        This method retrieves per-layer indexer k_cache data from TRT-LLM's
+        KVCacheManager.get_indexer_k_cache_pool_data() and stores it as pending
+        state. The actual registration happens in flush_registration().
+        
+        The indexer k_cache stores compressed key representations used by Dense Sparse
+        Attention (DSA) to select relevant KV cache chunks. Each layer's indexer tensor
+        is reshaped into [num_blocks, block_size, head_size] format, consistent with
+        vLLM's per-layer indexer tensor shape.
+        
+        Args:
+            kv_cache_manager: TRT-LLM's KVCacheManager instance, which provides
+                get_indexer_k_cache_pool_data(layer_idx) to retrieve per-layer indexer data.
+        """
+        flexkv_logger.info("Start collecting indexer kv_caches")
+        
+        if not hasattr(self, '_correct_device_id'):
+            raise RuntimeError("register_kv_caches must be called before register_indexer_kv_caches")
+        
+        num_layers = kv_cache_manager.num_local_layers
+        block_size = self.flexkv_config.cache_config.tokens_per_block
+        
+        # Collect per-layer indexer tensors
+        indexer_blocks = []
+        for layer_idx in range(num_layers):
+            # get_indexer_k_cache_pool_data returns [num_blocks, block_size * per_token_size]
+            # after the .view() in resource_manager.py
+            layer_data = kv_cache_manager.get_indexer_k_cache_pool_data(layer_idx)
+            # Reshape to [num_blocks, block_size, head_size] to match vLLM's format
+            indexer_num_blocks = layer_data.shape[0]
+            indexer_head_size = layer_data.shape[1] // block_size
+            layer_tensor = layer_data.view(indexer_num_blocks, block_size, indexer_head_size)
+            indexer_blocks.append(layer_tensor)
+        
+        if not indexer_blocks:
+            raise RuntimeError("No indexer blocks collected; ensure num_layers > 0 and indexer cache is initialized.")
+        sample = indexer_blocks[0]
+        indexer_num_blocks = sample.shape[0]
+        indexer_block_size = sample.shape[1]
+        indexer_head_size = sample.shape[2]
+        indexer_dtype = sample.dtype
+        
+        indexer_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST,
+            num_layer=num_layers,
+            num_block=indexer_num_blocks,
+            tokens_per_block=indexer_block_size,
+            num_head=1,
+            head_size=indexer_head_size,
+            is_mla=True,  # indexer cache is MLA-style (no K/V split)
+        )
+        
+        flexkv_logger.info(
+            f"Indexer cache layout: num_layers={num_layers}, "
+            f"num_blocks={indexer_num_blocks}, block_size={indexer_block_size}, "
+            f"head_size={indexer_head_size}, dtype={indexer_dtype}")
+        
+        self._pending_indexer_blocks = indexer_blocks
+        self._pending_indexer_layout = indexer_layout
+        self._pending_indexer_dtype = indexer_dtype
+
+    def flush_registration(self) -> None:
+        """Flush pending KV cache registration to the FlexKV server.
+        
+        This method sends a single registration request containing both the main
+        KV cache and (optionally) the sparse attention indexer cache. It must be
+        called after register_kv_caches() and (optionally) register_indexer_kv_caches().
+        
+        This deferred registration pattern ensures that both main and indexer caches
+        are registered atomically in a single request, avoiding race conditions.
+        """
+        if not hasattr(self, '_pending_gpu_blocks'):
+            raise RuntimeError("register_kv_caches must be called before flush_registration")
+        
+        correct_device_id = self._correct_device_id
+        
+        # Collect optional indexer state
+        indexer_blocks = getattr(self, '_pending_indexer_blocks', None)
+        indexer_layout = getattr(self, '_pending_indexer_layout', None)
+        indexer_dtype = getattr(self, '_pending_indexer_dtype', None)
+        
+        self.tp_client.register_to_server(
+            self._pending_gpu_blocks,
+            self._pending_gpu_layout,
+            override_device_id=correct_device_id,
+            indexer_caches=indexer_blocks,
+            indexer_layout=indexer_layout,
+            indexer_dtype=indexer_dtype,
+        )
+        
+        flexkv_logger.info(
+            f"Finish register kv_caches on device {correct_device_id}"
+            f"{' (with indexer)' if indexer_blocks else ''}")
+        
+        # Clean up pending state
+        del self._pending_gpu_blocks
+        del self._pending_gpu_layout
+        if hasattr(self, '_pending_indexer_blocks'):
+            del self._pending_indexer_blocks
+            del self._pending_indexer_layout
+            del self._pending_indexer_dtype
 
     def start_load_kv(self, stream: torch.cuda.Stream):
         return
