@@ -97,6 +97,10 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    # pending_count tracks how many workers (main KV + indexer) have not yet completed this op.
+    # Initialized to 1; incremented before submitting to indexer worker.
+    # _scheduler_loop decrements it on each worker completion; finalization happens only when it reaches 0.
+    pending_count: int = 1
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \

@@ -1,4 +1,3 @@
-
 import json
 import os
 import torch
@@ -40,6 +39,27 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
+        if hf_config is None:
+            return
+
+        try:
+            qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
+            if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
+                return
+
+            self.cache_config.indexer = IndexerCacheConfig(
+                head_size=qk_rope_head_dim,
+                num_kv_heads=1,
+                dtype=torch.uint8,
+            )
+            source_label = f" ({source})" if source else ""
+            logger.info(
+                f"Detected sparse attention indexer config{source_label}: "
+                f"head_size={qk_rope_head_dim}, dtype=uint8")
+        except Exception as e:
+            logger.debug(f"Could not detect indexer config ({source}): {e}")
+
     @classmethod
     def from_env(cls) -> 'FlexKVConfig':
         enable_flexkv = bool(int(os.getenv('ENABLE_FLEXKV', 1)))
@@ -76,12 +96,15 @@ class FlexKVConfig:
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        hf_config = getattr(vllm_config.model_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="vllm")
 
     def post_init_from_sglang_config(
         self,
         sglang_config,
         tp_size: int,
         page_size: int,
+        num_local_layers: int = 0,
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -89,11 +112,13 @@ class FlexKVConfig:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             tp_size: tensor parallel size used by sglang
             page_size: KV block size (tokens per block) used by sglang
+            num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
         """
         # cache config
         self.cache_config.tokens_per_block = int(page_size)
 
-        self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        total_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
+        self.model_config.num_layers = int(num_local_layers) if num_local_layers > 0 else total_layers
 
         if hasattr(sglang_config, "get_num_kv_heads"):
             try:
@@ -117,6 +142,9 @@ class FlexKVConfig:
         self.model_config.tp_size = int(tp_size)
         self.model_config.dp_size = int(getattr(sglang_config, "dp_size", 1))
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
+        
+        hf_config = getattr(sglang_config, 'hf_config', None)
+        self._detect_indexer_config_from_hf(hf_config, source="sglang")
 
     def post_init_from_trt_config(
         self,
@@ -197,7 +225,8 @@ class FlexKVConfig:
                 else:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
-            
+
+            self._detect_indexer_config_from_hf(hf_config, source="TRT-LLM")
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")
         # Update cache config with user config after model config is initialized
