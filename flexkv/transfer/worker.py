@@ -175,6 +175,17 @@ class TransferWorkerBase(ABC):
         else:
             dst_block_ids = self.op_buffer_tensor[dst_slot_id, :valid_block_num]
 
+        # [DIAG] Log block_ids source and values
+        flexkv_logger.debug(
+            f"[DIAG] get_transfer_block_ids: op_id={transfer_op.transfer_op_id}, "
+            f"type={transfer_op.transfer_type.name}, "
+            f"src_slot_id={src_slot_id}, dst_slot_id={dst_slot_id}, "
+            f"valid_block_num={valid_block_num}, "
+            f"src_len={len(src_block_ids)}, dst_len={len(dst_block_ids)}, "
+            f"src_first5={src_block_ids[:5].tolist() if len(src_block_ids) > 0 else []}, "
+            f"dst_first5={dst_block_ids[:5].tolist() if len(dst_block_ids) > 0 else []}"
+        )
+
         return src_block_ids, dst_block_ids
 
     def _log_transfer_performance(self,
@@ -396,6 +407,63 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
+        # [DIAG] Validate block_ids before CUDA kernel execution
+        transfer_type = transfer_op.transfer_type
+        if transfer_type == TransferType.D2H:
+            gpu_block_ids = src_block_ids
+            diag_label = "src(GPU)"
+        elif transfer_type == TransferType.H2D:
+            gpu_block_ids = dst_block_ids
+            diag_label = "dst(GPU)"
+        else:
+            gpu_block_ids = None
+            diag_label = "N/A"
+
+        num_gpu_blocks = self.gpu_blocks[0].shape[0] if len(self.gpu_blocks) > 0 else 0
+        if gpu_block_ids is not None and len(gpu_block_ids) > 0:
+            bid_min = gpu_block_ids.min().item()
+            bid_max = gpu_block_ids.max().item()
+            flexkv_logger.info(
+                f"[DIAG] GPUCPU launch_transfer: op_id={transfer_op.transfer_op_id}, "
+                f"type={transfer_type.name}, layer_id={layer_id}, layer_gran={layer_granularity}, "
+                f"valid_blocks={transfer_op.valid_block_num}, "
+                f"{diag_label}_block_ids_range=[{bid_min}, {bid_max}], "
+                f"num_gpu_blocks={num_gpu_blocks}, "
+                f"block_ids_first5={gpu_block_ids[:5].tolist()}, "
+                f"block_ids_last5={gpu_block_ids[-5:].tolist()}"
+            )
+            if bid_min < 0:
+                flexkv_logger.error(
+                    f"[DIAG] NEGATIVE {diag_label} block_ids! op_id={transfer_op.transfer_op_id}, "
+                    f"min={bid_min}, negative_ids={gpu_block_ids[gpu_block_ids < 0][:10].tolist()}"
+                )
+                nvtx.end_range(nvtx_range)
+                return False
+            if bid_max >= num_gpu_blocks:
+                flexkv_logger.error(
+                    f"[DIAG] OUT-OF-RANGE {diag_label} block_ids! op_id={transfer_op.transfer_op_id}, "
+                    f"max={bid_max}, num_gpu_blocks={num_gpu_blocks}, "
+                    f"oob_ids={gpu_block_ids[gpu_block_ids >= num_gpu_blocks][:10].tolist()}"
+                )
+                nvtx.end_range(nvtx_range)
+                return False
+        elif gpu_block_ids is not None and len(gpu_block_ids) == 0:
+            flexkv_logger.warning(
+                f"[DIAG] GPUCPU launch_transfer: EMPTY block_ids! "
+                f"op_id={transfer_op.transfer_op_id}, type={transfer_type.name}, "
+                f"valid_blocks={transfer_op.valid_block_num}"
+            )
+
+        # [DIAG] Validate layer range
+        if layer_id + layer_granularity > self.num_layers:
+            flexkv_logger.error(
+                f"[DIAG] LAYER OUT-OF-RANGE! op_id={transfer_op.transfer_op_id}, "
+                f"layer_id={layer_id}, layer_granularity={layer_granularity}, "
+                f"num_layers={self.num_layers}"
+            )
+            nvtx.end_range(nvtx_range)
+            return False
+
         with torch.cuda.stream(self.transfer_stream):
             start_time = time.time()
             self._transfer_impl(
@@ -459,6 +527,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
+        self.num_gpu_blocks = gpu_kv_layouts[0].num_block  # [DIAG] Store for block_ids validation
         # here the chunk size doesn't include the layer info
         self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
                                 for gpu_kv_layout in gpu_kv_layouts]
@@ -569,6 +638,60 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             layer_granularity = self.num_layers
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        # [DIAG] Validate block_ids before CUDA kernel execution
+        transfer_type = transfer_op.transfer_type
+        if transfer_type == TransferType.D2H:
+            gpu_block_ids = src_block_ids
+            diag_label = "src(GPU)"
+        elif transfer_type == TransferType.H2D:
+            gpu_block_ids = dst_block_ids
+            diag_label = "dst(GPU)"
+        else:
+            gpu_block_ids = None
+            diag_label = "N/A"
+
+        if gpu_block_ids is not None and len(gpu_block_ids) > 0:
+            bid_min = gpu_block_ids.min().item()
+            bid_max = gpu_block_ids.max().item()
+            flexkv_logger.info(
+                f"[DIAG] tpGPUCPU launch_transfer: op_id={transfer_op.transfer_op_id}, "
+                f"type={transfer_type.name}, layer_id={layer_id}, layer_gran={layer_granularity}, "
+                f"valid_blocks={transfer_op.valid_block_num}, "
+                f"{diag_label}_block_ids_range=[{bid_min}, {bid_max}], "
+                f"num_gpu_blocks={self.num_gpu_blocks}, "
+                f"block_ids_first5={gpu_block_ids[:5].tolist()}, "
+                f"block_ids_last5={gpu_block_ids[-5:].tolist()}"
+            )
+            # Check for out-of-range or negative block_ids
+            if bid_min < 0:
+                flexkv_logger.error(
+                    f"[DIAG] NEGATIVE {diag_label} block_ids! op_id={transfer_op.transfer_op_id}, "
+                    f"min={bid_min}, negative_ids={gpu_block_ids[gpu_block_ids < 0][:10].tolist()}"
+                )
+                return False
+            if bid_max >= self.num_gpu_blocks:
+                flexkv_logger.error(
+                    f"[DIAG] OUT-OF-RANGE {diag_label} block_ids! op_id={transfer_op.transfer_op_id}, "
+                    f"max={bid_max}, num_gpu_blocks={self.num_gpu_blocks}, "
+                    f"oob_ids={gpu_block_ids[gpu_block_ids >= self.num_gpu_blocks][:10].tolist()}"
+                )
+                return False
+        elif gpu_block_ids is not None and len(gpu_block_ids) == 0:
+            flexkv_logger.warning(
+                f"[DIAG] tpGPUCPU launch_transfer: EMPTY block_ids! "
+                f"op_id={transfer_op.transfer_op_id}, type={transfer_type.name}, "
+                f"valid_blocks={transfer_op.valid_block_num}"
+            )
+
+        # [DIAG] Also validate layer range
+        if layer_id + layer_granularity > self.num_layers:
+            flexkv_logger.error(
+                f"[DIAG] LAYER OUT-OF-RANGE! op_id={transfer_op.transfer_op_id}, "
+                f"layer_id={layer_id}, layer_granularity={layer_granularity}, "
+                f"num_layers={self.num_layers}"
+            )
+            return False
 
         start_time = time.time()
         self._transfer_impl(
