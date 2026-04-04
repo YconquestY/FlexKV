@@ -714,7 +714,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(
                 f"[DIAG] tpGPUCPU launch_transfer CPU block_ids: op_id={transfer_op.transfer_op_id}, "
                 f"cpu_block_ids_range=[{cpu_bid_min}, {cpu_bid_max}], "
-                f"num_cpu_blocks={self.num_cpu_blocks}, "
+                f"num_cpu_blocks={getattr(self, 'num_cpu_blocks', 'N/A')}, "
                 f"cpu_block_ids_first5={cpu_block_ids_diag[:5].tolist()}, "
                 f"cpu_block_ids_last5={cpu_block_ids_diag[-5:].tolist()}, "
                 f"src_block_ids_data_ptr=0x{src_block_ids.data_ptr():x}, "
@@ -739,7 +739,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             f"cpu_tp_stride={self.cpu_tp_stride_in_bytes}, "
             f"cpu_chunk_size={self.cpu_chunk_size_in_bytes}, "
             f"is_mla={self.is_mla}, num_layers={self.num_layers}, "
-            f"num_gpu_blocks={self.num_gpu_blocks}, num_cpu_blocks={self.num_cpu_blocks}, "
+            f"num_gpu_blocks={self.num_gpu_blocks}, num_cpu_blocks={getattr(self, 'num_cpu_blocks', 'N/A')}, "
             f"use_ce_d2h={self.use_ce_transfer_d2h}, use_ce_h2d={self.use_ce_transfer_h2d}, "
             f"cta_d2h={self.transfer_num_cta_d2h}, cta_h2d={self.transfer_num_cta_h2d}"
         )
