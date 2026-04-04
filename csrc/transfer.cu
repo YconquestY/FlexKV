@@ -16,6 +16,8 @@
  */
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <cstdio>
+#include <chrono>
 
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
@@ -89,6 +91,45 @@ void transfer_kv_blocks(
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
     bool use_ce_transfer, bool is_mla, bool sync) {
 
+  // [DIAG] Log transfer_kv_blocks entry with all parameters
+  fprintf(stderr, "[DIAG] transfer_kv_blocks<%d> ENTER: num_blocks=%d, start_layer=%d, num_layers=%d, "
+          "gpu_startoff=%lld, cpu_startoff=%lld, chunk_size=%lld, "
+          "cpu_kv_stride=%lld, cpu_layer_stride=%lld, cpu_block_stride=%lld, "
+          "transfer_num_cta=%d, is_h2d=%d, use_ce=%d, is_mla=%d, sync=%d, "
+          "stream=%p, cpu_ptr=%p, gpu_block_ids=%p, cpu_block_ids=%p\n",
+          static_cast<int>(Type), num_blocks, start_layer_id, num_layers,
+          (long long)gpu_startoff_inside_chunks, (long long)cpu_startoff_inside_chunks,
+          (long long)chunk_size_in_bytes,
+          (long long)cpu_kv_stride_in_bytes, (long long)cpu_layer_stride_in_bytes,
+          (long long)cpu_block_stride_in_bytes,
+          transfer_num_cta, (int)is_host_to_device, (int)use_ce_transfer, (int)is_mla, (int)sync,
+          (void*)stream, cpu_ptr, (void*)gpu_block_ids, (void*)cpu_block_ids);
+
+  // [DIAG] Dump block_ids
+  {
+    fprintf(stderr, "[DIAG] transfer_kv_blocks gpu_block_ids (first %d): [", std::min(num_blocks, 10));
+    for (int k = 0; k < std::min(num_blocks, 10); k++) {
+      if (k > 0) fprintf(stderr, ",");
+      fprintf(stderr, "%lld", (long long)gpu_block_ids[k]);
+    }
+    fprintf(stderr, "]\n");
+    fprintf(stderr, "[DIAG] transfer_kv_blocks cpu_block_ids (first %d): [", std::min(num_blocks, 10));
+    for (int k = 0; k < std::min(num_blocks, 10); k++) {
+      if (k > 0) fprintf(stderr, ",");
+      fprintf(stderr, "%lld", (long long)cpu_block_ids[k]);
+    }
+    fprintf(stderr, "]\n");
+  }
+
+  // [DIAG] Check pre-existing error
+  {
+    cudaError_t pre_err = cudaPeekAtLastError();
+    if (pre_err != cudaSuccess) {
+      fprintf(stderr, "[DIAG] transfer_kv_blocks: PRE-EXISTING CUDA error: %s (code=%d)\n",
+              cudaGetErrorString(pre_err), static_cast<int>(pre_err));
+    }
+  }
+
   int block_size = 1024;
 
   int block_count = transfer_num_cta;
@@ -142,6 +183,32 @@ void transfer_kv_blocks(
       }
     }
   } else {
+    // [DIAG] Log kernel launch parameters
+    fprintf(stderr, "[DIAG] transfer_kv_blocks: launching kernel with gridDim=%d, blockDim=%d, "
+            "chunk_size_in_int64=%lld, copy_size_in_float4=%lld\n",
+            block_count, block_size,
+            (long long)chunk_size_in_int64,
+            (long long)(chunk_size_in_int64 * (int64_t)sizeof(int64_t) / (int64_t)sizeof(float4)));
+
+    // [DIAG] Validate GPU pointer for first block before kernel launch
+    if (num_blocks > 0) {
+      int kv_dim = is_mla ? 1 : 2;
+      for (int ki = 0; ki < kv_dim && ki < 1; ki++) {
+        int64_t *test_gpu_ptr = ptr_at<Type>(gpu_tensor_handler, start_layer_id, ki, gpu_block_ids[0]);
+        int64_t *test_gpu_chunk = reinterpret_cast<int64_t *>(test_gpu_ptr) + gpu_startoff_inside_chunks_int64;
+        int64_t *test_cpu_chunk = cpu_ptr_int64 + start_layer_id * cpu_layer_stride_int64
+                                  + ki * cpu_kv_stride_int64
+                                  + cpu_block_ids[0] * cpu_block_stride_int64
+                                  + cpu_startoff_inside_chunks_int64;
+        fprintf(stderr, "[DIAG] transfer_kv_blocks: block[0] gpu_ptr=0x%llx, gpu_chunk_ptr=0x%llx, "
+                "cpu_chunk_ptr=0x%llx, gpu_block_id=%lld, cpu_block_id=%lld\n",
+                (unsigned long long)reinterpret_cast<uintptr_t>(test_gpu_ptr),
+                (unsigned long long)reinterpret_cast<uintptr_t>(test_gpu_chunk),
+                (unsigned long long)reinterpret_cast<uintptr_t>(test_cpu_chunk),
+                (long long)gpu_block_ids[0], (long long)cpu_block_ids[0]);
+      }
+    }
+
     // Custom kernel transfer
     transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids,
@@ -149,6 +216,15 @@ void transfer_kv_blocks(
         cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
         cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
         chunk_size_in_int64, is_mla, is_host_to_device);
+
+    // [DIAG] Check error immediately after kernel launch
+    {
+      cudaError_t kernel_launch_err = cudaGetLastError();
+      if (kernel_launch_err != cudaSuccess) {
+        fprintf(stderr, "[DIAG] transfer_kv_blocks: KERNEL LAUNCH ERROR: %s (code=%d)\n",
+                cudaGetErrorString(kernel_launch_err), static_cast<int>(kernel_launch_err));
+      }
+    }
 
     // Record transfer metrics after kernel launch (cannot record inside kernel)
     // Total bytes = actual_chunk_bytes * num_layers * kv_dim * num_blocks
@@ -168,7 +244,24 @@ void transfer_kv_blocks(
             static_cast<int64_t>(kv_dim) * static_cast<int64_t>(num_blocks));
   }
   if (sync) {
-    cudaStreamSynchronize(stream);
+    auto sync_start = std::chrono::high_resolution_clock::now();
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    auto sync_end = std::chrono::high_resolution_clock::now();
+    double sync_ms = std::chrono::duration<double, std::milli>(sync_end - sync_start).count();
+    if (sync_err != cudaSuccess) {
+      fprintf(stderr, "[DIAG] transfer_kv_blocks: cudaStreamSynchronize FAILED: %s (code=%d), sync_ms=%.3f\n",
+              cudaGetErrorString(sync_err), static_cast<int>(sync_err), sync_ms);
+    } else {
+      fprintf(stderr, "[DIAG] transfer_kv_blocks: sync OK, sync_ms=%.3f\n", sync_ms);
+    }
+    // [DIAG] Check for any residual error after sync
+    cudaError_t post_sync_err = cudaPeekAtLastError();
+    if (post_sync_err != cudaSuccess) {
+      fprintf(stderr, "[DIAG] transfer_kv_blocks: POST-SYNC residual error: %s (code=%d)\n",
+              cudaGetErrorString(post_sync_err), static_cast<int>(post_sync_err));
+    }
+  } else {
+    fprintf(stderr, "[DIAG] transfer_kv_blocks: sync=false, skipping cudaStreamSynchronize\n");
   }
 }
 

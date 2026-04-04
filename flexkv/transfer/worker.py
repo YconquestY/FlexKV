@@ -234,8 +234,16 @@ class TransferWorkerBase(ABC):
                             transfer_status = self.launch_transfer(op)
                             nvtx.pop_range()
                         except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
+                            import traceback
+                            flexkv_logger.error(
+                                f"Error launching transfer: {e}\n"
+                                f"Failed transfer op: {op}\n"
+                                f"Op details: op_id={op.transfer_op_id}, graph_id={op.transfer_graph_id}, "
+                                f"type={op.transfer_type.name}, layer_id={op.layer_id}, "
+                                f"layer_gran={op.layer_granularity}, valid_blocks={op.valid_block_num}, "
+                                f"src_slot_id={op.src_slot_id}, dst_slot_id={op.dst_slot_id}\n"
+                                f"Traceback:\n{traceback.format_exc()}"
+                            )
                         if transfer_status:
                             ## only put the op when transfer success
                             self.finished_ops_queue.put(op.transfer_op_id)
@@ -693,14 +701,71 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             )
             return False
 
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-            layer_id,
-            layer_granularity,
+        # [DIAG] Also validate CPU block_ids
+        if transfer_type == TransferType.D2H:
+            cpu_block_ids_diag = dst_block_ids
+        elif transfer_type == TransferType.H2D:
+            cpu_block_ids_diag = src_block_ids
+        else:
+            cpu_block_ids_diag = None
+        if cpu_block_ids_diag is not None and len(cpu_block_ids_diag) > 0:
+            cpu_bid_min = cpu_block_ids_diag.min().item()
+            cpu_bid_max = cpu_block_ids_diag.max().item()
+            flexkv_logger.info(
+                f"[DIAG] tpGPUCPU launch_transfer CPU block_ids: op_id={transfer_op.transfer_op_id}, "
+                f"cpu_block_ids_range=[{cpu_bid_min}, {cpu_bid_max}], "
+                f"num_cpu_blocks={self.num_cpu_blocks}, "
+                f"cpu_block_ids_first5={cpu_block_ids_diag[:5].tolist()}, "
+                f"cpu_block_ids_last5={cpu_block_ids_diag[-5:].tolist()}, "
+                f"src_block_ids_data_ptr=0x{src_block_ids.data_ptr():x}, "
+                f"dst_block_ids_data_ptr=0x{dst_block_ids.data_ptr():x}, "
+                f"src_is_pinned={src_block_ids.is_pinned()}, "
+                f"dst_is_pinned={dst_block_ids.is_pinned()}, "
+                f"src_device={src_block_ids.device}, dst_device={dst_block_ids.device}"
+            )
+            if cpu_bid_min < 0:
+                flexkv_logger.error(
+                    f"[DIAG] NEGATIVE CPU block_ids! op_id={transfer_op.transfer_op_id}, "
+                    f"min={cpu_bid_min}"
+                )
+                return False
+
+        # [DIAG] Log transfer config parameters
+        flexkv_logger.info(
+            f"[DIAG] tpGPUCPU launch_transfer config: op_id={transfer_op.transfer_op_id}, "
+            f"cpu_kv_stride={self.cpu_kv_stride_in_bytes}, "
+            f"cpu_layer_stride={self.cpu_layer_stride_in_bytes}, "
+            f"cpu_block_stride={self.cpu_block_stride_in_bytes}, "
+            f"cpu_tp_stride={self.cpu_tp_stride_in_bytes}, "
+            f"cpu_chunk_size={self.cpu_chunk_size_in_bytes}, "
+            f"is_mla={self.is_mla}, num_layers={self.num_layers}, "
+            f"num_gpu_blocks={self.num_gpu_blocks}, num_cpu_blocks={self.num_cpu_blocks}, "
+            f"use_ce_d2h={self.use_ce_transfer_d2h}, use_ce_h2d={self.use_ce_transfer_h2d}, "
+            f"cta_d2h={self.transfer_num_cta_d2h}, cta_h2d={self.transfer_num_cta_h2d}"
         )
+
+        start_time = time.time()
+        try:
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+                layer_id,
+                layer_granularity,
+            )
+        except Exception as e:
+            import traceback
+            elapsed = time.time() - start_time
+            flexkv_logger.error(
+                f"[DIAG] tpGPUCPU _transfer_impl FAILED: op_id={transfer_op.transfer_op_id}, "
+                f"type={transfer_type.name}, elapsed={elapsed:.4f}s, "
+                f"layer_id={layer_id}, layer_gran={layer_granularity}, "
+                f"num_blocks={len(src_block_ids)}, "
+                f"gpu_block_ids_first5={gpu_block_ids[:5].tolist() if gpu_block_ids is not None and len(gpu_block_ids) > 0 else []}, "
+                f"error={e}\n"
+                f"Traceback:\n{traceback.format_exc()}"
+            )
+            raise  # re-raise to be caught by outer handler
         end_time = time.time()
 
         kv_dim = 2 if not self.is_mla else 1
