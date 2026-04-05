@@ -142,6 +142,7 @@ class TransferEngine:
 
         # self.dp_size = model_config.dp_size
         self.tp_size = model_config.tp_size
+        self.cp_size = model_config.cp_size
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
         self._has_indexer = False
