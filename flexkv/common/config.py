@@ -31,6 +31,7 @@ class ModelConfig:
 
     # parallel configs
     tp_size: int = 1
+    cp_size: int = 1
     dp_size: int = 1
     dp_rank: int = 0
     pp_size: int = 1

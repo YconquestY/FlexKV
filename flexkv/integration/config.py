@@ -110,6 +110,7 @@ class FlexKVConfig:
         self,
         sglang_config,
         tp_size: int,
+        cp_size: int,
         page_size: int,
         num_local_layers: int = 0,
         pp_size: int = 1,
@@ -122,6 +123,7 @@ class FlexKVConfig:
         Args:
             sglang_config: sglang.srt.configs.model_config.ModelConfig-like object
             tp_size: tensor parallel size used by sglang
+            cp_size: context parallel size used by sglang
             page_size: KV block size (tokens per block) used by sglang
             num_local_layers: number of layers on this PP rank (0 means no PP, use total layers)
             pp_size: pipeline parallel size (default 1, no PP)
@@ -163,6 +165,7 @@ class FlexKVConfig:
         self.model_config.use_mla = use_mla
 
         self.model_config.tp_size = int(tp_size)
+        self.model_config.cp_size = int(cp_size)
         self.model_config.dp_size = int(dp_size if dp_size is not None else 1)
         self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
