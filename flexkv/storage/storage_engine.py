@@ -6,6 +6,7 @@ import torch
 import hashlib
 
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
@@ -39,11 +40,17 @@ class StorageEngine:
                 dtype=self._model_config.dtype,
             )
             if self._indexer_config is not None:
+                indexer_page_size = self._indexer_config.page_size
+                indexer_num_cpu_blocks = (
+                    self._cache_config.num_cpu_blocks // indexer_page_size
+                    if indexer_page_size > 1
+                    else self._cache_config.num_cpu_blocks
+                )
                 indexer_cpu_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                     num_layer=self._model_config.num_layers,
-                    num_block=self._cache_config.num_cpu_blocks,
-                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_block=indexer_num_cpu_blocks,
+                    tokens_per_block=self._indexer_config.page_size,
                     num_head=self._indexer_config.num_kv_heads,
                     head_size=self._indexer_config.head_size,
                     is_mla=True
@@ -75,11 +82,17 @@ class StorageEngine:
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
             if self._indexer_config is not None:
+                indexer_page_size = self._indexer_config.page_size
+                indexer_num_ssd_blocks = (
+                    self._cache_config.num_ssd_blocks // indexer_page_size
+                    if indexer_page_size > 1
+                    else self._cache_config.num_ssd_blocks
+                )
                 indexer_ssd_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                     num_layer=self._model_config.num_layers,
-                    num_block=self._cache_config.num_ssd_blocks,
-                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_block=indexer_num_ssd_blocks,
+                    tokens_per_block=self._indexer_config.page_size,
                     num_head=self._indexer_config.num_kv_heads,
                     head_size=self._indexer_config.head_size,
                     is_mla=True
@@ -113,11 +126,17 @@ class StorageEngine:
                 remote_config_custom = self._cache_config.remote_config_custom
             )
             if self._indexer_config is not None:
+                indexer_page_size = self._indexer_config.page_size
+                indexer_num_remote_blocks = (
+                    self._cache_config.num_remote_blocks // indexer_page_size
+                    if indexer_page_size > 1
+                    else self._cache_config.num_remote_blocks
+                )
                 indexer_remote_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.remote_layout_type,
                     num_layer=self._model_config.num_layers,
-                    num_block=self._cache_config.num_remote_blocks,
-                    tokens_per_block=self._cache_config.tokens_per_block,
+                    num_block=indexer_num_remote_blocks,
+                    tokens_per_block=self._indexer_config.page_size,
                     num_head=self._indexer_config.num_kv_heads,
                     head_size=self._indexer_config.head_size,
                     is_mla=True
@@ -157,6 +176,26 @@ class StorageEngine:
             raw_data=gpu_blocks
         )
         if indexer_gpu_blocks is not None:
+            # Log indexer GPU registration parameters
+            indexer_page_size = self._indexer_config.page_size if self._indexer_config else 1
+            flexkv_logger.info(
+                f"[StorageEngine] Registering indexer GPU buffer: "
+                f"num_block={indexer_gpu_layout.num_block}, "
+                f"page_size={indexer_page_size}, "
+                f"head_size={indexer_gpu_layout.head_size}, "
+                f"num_head={indexer_gpu_layout.num_head}, "
+                f"dtype={indexer_dtype}"
+            )
+            # Validate indexer num_block vs main KV num_block
+            if indexer_page_size > 1:
+                expected_indexer_blocks = gpu_layout.num_block // indexer_page_size
+                if indexer_gpu_layout.num_block != expected_indexer_blocks:
+                    flexkv_logger.warning(
+                        f"[StorageEngine] Indexer GPU num_block mismatch: "
+                        f"indexer_num_block={indexer_gpu_layout.num_block}, "
+                        f"expected={expected_indexer_blocks} "
+                        f"(main_kv_num_block={gpu_layout.num_block} // page_size={indexer_page_size})"
+                    )
             self.allocate(
                 device_type=DeviceType.GPU,
                 layout=indexer_gpu_layout,

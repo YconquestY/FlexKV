@@ -40,7 +40,7 @@ class FlexKVConfig:
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-    def _detect_indexer_config_from_hf(self, hf_config, source: str = "") -> None:
+    def _detect_indexer_config_from_hf(self, hf_config, source: str = "", page_size: int = 1) -> None:
         if hf_config is None:
             return
 
@@ -53,11 +53,12 @@ class FlexKVConfig:
                 head_size=qk_rope_head_dim,
                 num_kv_heads=1,
                 dtype=torch.uint8,
+                page_size=page_size,
             )
             source_label = f" ({source})" if source else ""
             logger.info(
                 f"Detected sparse attention indexer config{source_label}: "
-                f"head_size={qk_rope_head_dim}, dtype=uint8")
+                f"head_size={qk_rope_head_dim}, dtype=uint8, page_size={page_size}")
         except Exception as e:
             logger.debug(f"Could not detect indexer config ({source}): {e}")
 
@@ -159,7 +160,7 @@ class FlexKVConfig:
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
         
         hf_config = getattr(sglang_config, 'hf_config', None)
-        self._detect_indexer_config_from_hf(hf_config, source="sglang")
+        self._detect_indexer_config_from_hf(hf_config, source="sglang", page_size=page_size)
 
     def post_init_from_trt_config(
         self,

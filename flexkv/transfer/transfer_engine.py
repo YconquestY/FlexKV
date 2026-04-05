@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import contextlib
 import nvtx
-import torch
+import numpy as np
 
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import StorageHandle
@@ -145,6 +145,11 @@ class TransferEngine:
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
         self._has_indexer = False
+
+        self._indexer_page_size = 1
+        if cache_config.indexer is not None:
+            self._indexer_page_size = cache_config.indexer.page_size
+        self._indexer_op_to_parent_op: Dict[int, int] = {}
 
     def _init_workers(self) -> None:
         if self._running:
@@ -715,10 +720,19 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self._indexer_finished_ops_queue.get_nowait()
-                                op = self.op_id_to_op[op_id]
-                                op.pending_count -= 1
-                                if op.pending_count == 0:
-                                    self._finalize_op(op, finished_ops)
+                                if op_id in self._indexer_op_to_parent_op:
+                                    indexer_op = self.op_id_to_op.pop(op_id)
+                                    free_op_from_buffer(indexer_op, self.pin_buffer)
+                                    parent_op_id = self._indexer_op_to_parent_op.pop(op_id)
+                                    parent_op = self.op_id_to_op[parent_op_id]
+                                    parent_op.pending_count -= 1
+                                    if parent_op.pending_count == 0:
+                                        self._finalize_op(parent_op, finished_ops)
+                                else:
+                                    op = self.op_id_to_op[op_id]
+                                    op.pending_count -= 1
+                                    if op.pending_count == 0:
+                                        self._finalize_op(op, finished_ops)
                             except queue.Empty:
                                 break
                         nvtx.end_range(nvtx_r2i)
@@ -779,6 +793,23 @@ class TransferEngine:
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
 
+    def _convert_to_page_level_block_ids(self, block_ids: np.ndarray) -> Optional[np.ndarray]:
+        page_size = self._indexer_page_size
+        if block_ids.size == 0:
+            return block_ids.copy()
+
+        if block_ids.size % page_size != 0:
+            flexkv_logger.error(
+                f"[TransferEngine] block_ids size {block_ids.size} is not a multiple "
+                f"of indexer page_size {page_size}. Skipping indexer transfer."
+            )
+            return None
+
+        reshaped = block_ids.reshape(-1, page_size)
+        page_block_ids = reshaped[:, 0] // page_size
+
+        return page_block_ids.astype(np.int64)
+
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(f"schedule {op.transfer_type.name} "
                                                                        f"op_id: {op.op_id}, "
@@ -792,12 +823,42 @@ class TransferEngine:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
         if self._has_indexer and op.transfer_type in self._indexer_worker_map:
-            op.pending_count += 1
-            indexer_worker = self._indexer_worker_map[op.transfer_type]
-            if isinstance(indexer_worker, List):
-                indexer_worker[op.dp_id].submit_transfer(op)
+            if self._indexer_page_size > 1:
+                src_page_ids = self._convert_to_page_level_block_ids(op.src_block_ids)
+                dst_page_ids = self._convert_to_page_level_block_ids(op.dst_block_ids)
+
+                if src_page_ids is not None and dst_page_ids is not None:
+                    indexer_op = TransferOp(
+                        graph_id=op.graph_id,
+                        transfer_type=op.transfer_type,
+                        src_block_ids=src_page_ids,
+                        dst_block_ids=dst_page_ids,
+                        layer_id=op.layer_id,
+                        layer_granularity=op.layer_granularity,
+                        dp_id=op.dp_id,
+                    )
+                    register_op_to_buffer(indexer_op, self.pin_buffer)
+                    self._indexer_op_to_parent_op[indexer_op.op_id] = op.op_id
+                    self.op_id_to_op[indexer_op.op_id] = indexer_op
+                    op.pending_count += 1
+
+                    indexer_worker = self._indexer_worker_map[op.transfer_type]
+                    if isinstance(indexer_worker, List):
+                        indexer_worker[op.dp_id].submit_transfer(indexer_op)
+                    else:
+                        indexer_worker.submit_transfer(indexer_op)
+                else:
+                    flexkv_logger.warning(
+                        f"[TransferEngine] Skipping indexer transfer for op {op.op_id} "
+                        f"due to page-level block_ids conversion failure."
+                    )
             else:
-                indexer_worker.submit_transfer(op)
+                op.pending_count += 1
+                indexer_worker = self._indexer_worker_map[op.transfer_type]
+                if isinstance(indexer_worker, List):
+                    indexer_worker[op.dp_id].submit_transfer(op)
+                else:
+                    indexer_worker.submit_transfer(op)
 
         worker = self._worker_map[op.transfer_type]
         if isinstance(worker, List):
