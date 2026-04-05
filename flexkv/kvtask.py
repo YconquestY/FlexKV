@@ -107,38 +107,28 @@ class KVTaskManager:
         self.model_config = model_config
         self._check_config(model_config, cache_config)
 
-        self.is_multinode_tp = False
-        self.tp_node_count = 1
-        if self.model_config.tp_size > torch.cuda.device_count():
-            if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP for now")
-            assert self.model_config.dp_size == 1
-            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
-            self.is_multinode_tp = True
-
         self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
-        model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp:
-            model_config_for_transfer.tp_size //= self.tp_node_count
-            if not self.model_config.use_mla:
-                model_config_for_transfer.num_kv_heads //= self.tp_node_count
-
         combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
-        if not combine_with_trtllm:
-            self.transfer_handles = [TransferManagerHandle(
-                model_config_for_transfer,
-                self.cache_config,
-                mode="process",
-                gpu_register_port=gpu_register_port
-            )]
-        else:
-            # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
-            #  to avoid the way we launch subprocess in FlexKV
-            #  conflict with TensorRT-LLM's MPI initialization
-            master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
-            self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
+        if self.model_config.cp_size > torch.cuda.device_count():
+            # WARN: 2-tray CP8 is SGLang-only.
+            assert self.model_config.dp_size == 1
+            assert torch.cuda.device_count() == 4 and self.model_config.cp_size == 8, \
+                "CP8 on 2 NVL72 compute trays"
+            
+            self.cp_node_count = self.model_config.cp_size // torch.cuda.device_count()
+
+            model_config_for_transfer = copy.deepcopy(self.model_config)
+            model_config_for_transfer.cp_size //= self.cp_node_count
+
+            master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles = [
+                TransferManagerHandle(
+                    model_config_for_transfer,
+                    self.cache_config,
+                    mode="process",
+                    gpu_register_port=gpu_register_port
+                ),
                 TransferManagerHandle(
                     model_config_for_transfer,
                     self.cache_config,
@@ -148,9 +138,45 @@ class KVTaskManager:
                     master_ports=master_ports
                 )
             ]
-            self.transfer_handles[0]._handle.send_config_to_remotes()
+            self.transfer_handles[-1]._handle.send_config_to_remotes()
+        elif self.model_config.tp_size > torch.cuda.device_count():
+            # INFO: 2-node TP works for vLLM, SGLang and TensorRT-LLM.
+            assert self.model_config.dp_size == 1
+            if self.model_config.tp_size != torch.cuda.device_count() * 2:
+                raise ValueError("Only support 2 nodes TP for now")
+            
+            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
 
-        if self.is_multinode_tp:
+            model_config_for_transfer = copy.deepcopy(self.model_config)
+            model_config_for_transfer.tp_size //= self.tp_node_count
+            if not self.model_config.use_mla:
+                model_config_for_transfer.num_kv_heads //= self.tp_node_count
+
+            if not combine_with_trtllm:
+                self.transfer_handles = [TransferManagerHandle(
+                    model_config_for_transfer,
+                    self.cache_config,
+                    mode="process",
+                    gpu_register_port=gpu_register_port
+                )]
+            else:
+                # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
+                #  to avoid the way we launch subprocess in FlexKV
+                #  conflict with TensorRT-LLM's MPI initialization
+                master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+                self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
+                self.transfer_handles = [
+                    TransferManagerHandle(
+                        model_config_for_transfer,
+                        self.cache_config,
+                        mode="remote",
+                        gpu_register_port=gpu_register_port,
+                        master_host=master_host,
+                        master_ports=master_ports
+                    )
+                ]
+                self.transfer_handles[0]._handle.send_config_to_remotes()
+
             master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles.append(TransferManagerHandle(
                 model_config_for_transfer,
@@ -161,6 +187,25 @@ class KVTaskManager:
                 master_ports=master_ports
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
+        elif not combine_with_trtllm:
+            self.transfer_handles = [TransferManagerHandle(
+                copy.deepcopy(self.model_config),
+                self.cache_config,
+                mode="process",
+                gpu_register_port=gpu_register_port
+            )]
+        else:
+            master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+            self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
+            self.transfer_handles = [TransferManagerHandle(
+                copy.deepcopy(self.model_config),
+                self.cache_config,
+                mode="remote",
+                gpu_register_port=gpu_register_port,
+                master_host=master_host,
+                master_ports=master_ports
+            )]
+            self.transfer_handles[0]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
 
