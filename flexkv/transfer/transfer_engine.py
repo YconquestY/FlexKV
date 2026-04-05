@@ -798,12 +798,22 @@ class TransferEngine:
         if block_ids.size == 0:
             return block_ids.copy()
 
-        if block_ids.size % page_size != 0:
-            flexkv_logger.error(
-                f"[TransferEngine] block_ids size {block_ids.size} is not a multiple "
-                f"of indexer page_size {page_size}. Skipping indexer transfer."
+        # Truncate to the nearest multiple of page_size (floor alignment)
+        aligned_size = (block_ids.size // page_size) * page_size
+        if aligned_size == 0:
+            flexkv_logger.debug(
+                f"[TransferEngine] block_ids size {block_ids.size} is less than "
+                f"indexer page_size {page_size}. No indexer pages to transfer."
             )
-            return None
+            return np.array([], dtype=np.int64)
+
+        if aligned_size != block_ids.size:
+            flexkv_logger.debug(
+                f"[TransferEngine] block_ids size {block_ids.size} is not a multiple "
+                f"of indexer page_size {page_size}. Truncating to {aligned_size} "
+                f"for indexer transfer ({aligned_size // page_size} pages)."
+            )
+            block_ids = block_ids[:aligned_size]
 
         reshaped = block_ids.reshape(-1, page_size)
         page_block_ids = reshaped[:, 0] // page_size
@@ -828,25 +838,42 @@ class TransferEngine:
                 dst_page_ids = self._convert_to_page_level_block_ids(op.dst_block_ids)
 
                 if src_page_ids is not None and dst_page_ids is not None:
-                    indexer_op = TransferOp(
-                        graph_id=op.graph_id,
-                        transfer_type=op.transfer_type,
-                        src_block_ids=src_page_ids,
-                        dst_block_ids=dst_page_ids,
-                        layer_id=op.layer_id,
-                        layer_granularity=op.layer_granularity,
-                        dp_id=op.dp_id,
-                    )
-                    register_op_to_buffer(indexer_op, self.pin_buffer)
-                    self._indexer_op_to_parent_op[indexer_op.op_id] = op.op_id
-                    self.op_id_to_op[indexer_op.op_id] = indexer_op
-                    op.pending_count += 1
+                    # Ensure both sides have the same number of pages after truncation
+                    min_pages = min(src_page_ids.size, dst_page_ids.size)
+                    if min_pages == 0:
+                        flexkv_logger.debug(
+                            f"[TransferEngine] No indexer pages to transfer for op {op.op_id} "
+                            f"after page-level alignment."
+                        )
+                    elif src_page_ids.size != dst_page_ids.size:
+                        flexkv_logger.warning(
+                            f"[TransferEngine] src_page_ids size {src_page_ids.size} != "
+                            f"dst_page_ids size {dst_page_ids.size} for op {op.op_id}. "
+                            f"Truncating both to {min_pages} pages."
+                        )
+                        src_page_ids = src_page_ids[:min_pages]
+                        dst_page_ids = dst_page_ids[:min_pages]
 
-                    indexer_worker = self._indexer_worker_map[op.transfer_type]
-                    if isinstance(indexer_worker, List):
-                        indexer_worker[op.dp_id].submit_transfer(indexer_op)
-                    else:
-                        indexer_worker.submit_transfer(indexer_op)
+                    if min_pages > 0:
+                        indexer_op = TransferOp(
+                            graph_id=op.graph_id,
+                            transfer_type=op.transfer_type,
+                            src_block_ids=src_page_ids,
+                            dst_block_ids=dst_page_ids,
+                            layer_id=op.layer_id,
+                            layer_granularity=op.layer_granularity,
+                            dp_id=op.dp_id,
+                        )
+                        register_op_to_buffer(indexer_op, self.pin_buffer)
+                        self._indexer_op_to_parent_op[indexer_op.op_id] = op.op_id
+                        self.op_id_to_op[indexer_op.op_id] = indexer_op
+                        op.pending_count += 1
+
+                        indexer_worker = self._indexer_worker_map[op.transfer_type]
+                        if isinstance(indexer_worker, List):
+                            indexer_worker[op.dp_id].submit_transfer(indexer_op)
+                        else:
+                            indexer_worker.submit_transfer(indexer_op)
                 else:
                     flexkv_logger.warning(
                         f"[TransferEngine] Skipping indexer transfer for op {op.op_id} "
