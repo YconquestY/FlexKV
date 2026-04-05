@@ -708,6 +708,12 @@ class TransferEngine:
                                 op_id = self.finished_ops_queue.get_nowait()
                                 op = self.op_id_to_op[op_id]
                                 op.pending_count -= 1
+                                flexkv_logger.info(
+                                    f"[TransferEngine][MainKVComplete] op_id={op_id}, "
+                                    f"graph_id={op.graph_id}, transfer_type={op.transfer_type.name}, "
+                                    f"src_blocks={op.src_block_ids.size}, dst_blocks={op.dst_block_ids.size}, "
+                                    f"remaining_pending_count={op.pending_count}"
+                                )
                                 if op.pending_count == 0:
                                     self._finalize_op(op, finished_ops)
                             except queue.Empty:
@@ -720,17 +726,34 @@ class TransferEngine:
                         while True:
                             try:
                                 op_id = self._indexer_finished_ops_queue.get_nowait()
+                                flexkv_logger.info(
+                                    f"[TransferEngine][IndexerComplete] indexer_op_id={op_id}, "
+                                    f"is_child_op={op_id in self._indexer_op_to_parent_op}"
+                                )
                                 if op_id in self._indexer_op_to_parent_op:
                                     indexer_op = self.op_id_to_op.pop(op_id)
                                     free_op_from_buffer(indexer_op, self.pin_buffer)
                                     parent_op_id = self._indexer_op_to_parent_op.pop(op_id)
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
+                                    flexkv_logger.info(
+                                        f"[TransferEngine][IndexerComplete] indexer_op_id={op_id} -> "
+                                        f"parent_op_id={parent_op_id}, parent_graph_id={parent_op.graph_id}, "
+                                        f"parent_transfer_type={parent_op.transfer_type.name}, "
+                                        f"indexer_src_pages={indexer_op.src_block_ids.size}, "
+                                        f"indexer_dst_pages={indexer_op.dst_block_ids.size}, "
+                                        f"parent_remaining_pending_count={parent_op.pending_count}"
+                                    )
                                     if parent_op.pending_count == 0:
                                         self._finalize_op(parent_op, finished_ops)
                                 else:
                                     op = self.op_id_to_op[op_id]
                                     op.pending_count -= 1
+                                    flexkv_logger.info(
+                                        f"[TransferEngine][IndexerComplete] direct_op_id={op_id}, "
+                                        f"graph_id={op.graph_id}, transfer_type={op.transfer_type.name}, "
+                                        f"remaining_pending_count={op.pending_count}"
+                                    )
                                     if op.pending_count == 0:
                                         self._finalize_op(op, finished_ops)
                             except queue.Empty:
@@ -750,6 +773,13 @@ class TransferEngine:
                 nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
                 if finished_ops or new_graphs_num > 0:
                     completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
+                    flexkv_logger.info(
+                        f"[TransferEngine][Schedule] finished_ops_count={len(finished_ops)}, "
+                        f"new_graphs_num={new_graphs_num}, "
+                        f"completed_graph_ids={completed_graph_ids}, "
+                        f"next_ops_count={len(next_ops)}, "
+                        f"next_ops_summary=[{', '.join(f'op_id={o.op_id}/type={o.transfer_type.name}/src={o.src_block_ids.size}/dst={o.dst_block_ids.size}' for o in next_ops)}]"
+                    )
                     # Distribute new ops to workers
                     for op in next_ops:
                         if op.transfer_type == TransferType.VIRTUAL:
@@ -783,6 +813,15 @@ class TransferEngine:
         num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
         num_bytes = num_blocks * self.cache_config.tokens_per_block * self.model_config.token_size_in_bytes
         transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
+        flexkv_logger.info(
+            f"[TransferEngine][FinalizeOp] op_id={op.op_id}, graph_id={op.graph_id}, "
+            f"transfer_type={transfer_type_str}, num_blocks={num_blocks}, "
+            f"num_bytes={num_bytes}, "
+            f"src_block_ids.size={op.src_block_ids.size if op.src_block_ids is not None else 'None'}, "
+            f"dst_block_ids.size={op.dst_block_ids.size if op.dst_block_ids is not None else 'None'}, "
+            f"src_block_ids[:8]={op.src_block_ids[:8].tolist() if op.src_block_ids is not None and op.src_block_ids.size > 0 else []}, "
+            f"dst_block_ids[:8]={op.dst_block_ids[:8].tolist() if op.dst_block_ids is not None and op.dst_block_ids.size > 0 else []}"
+        )
         self.completed_queue.put(CompletedOp(
             graph_id=op.graph_id,
             op_id=op.op_id,
@@ -795,28 +834,46 @@ class TransferEngine:
 
     def _convert_to_page_level_block_ids(self, block_ids: np.ndarray) -> Optional[np.ndarray]:
         page_size = self._indexer_page_size
+        flexkv_logger.info(
+            f"[TransferEngine][PageConvert] Input: block_ids.size={block_ids.size}, "
+            f"page_size={page_size}, block_ids.dtype={block_ids.dtype}, "
+            f"block_ids[:8]={block_ids[:8].tolist() if block_ids.size > 0 else []}, "
+            f"block_ids[-8:]={block_ids[-8:].tolist() if block_ids.size > 0 else []}"
+        )
         if block_ids.size == 0:
+            flexkv_logger.info(
+                f"[TransferEngine][PageConvert] Empty block_ids, returning empty copy."
+            )
             return block_ids.copy()
 
         # Truncate to the nearest multiple of page_size (floor alignment)
         aligned_size = (block_ids.size // page_size) * page_size
+        tail_size = block_ids.size - aligned_size
         if aligned_size == 0:
-            flexkv_logger.debug(
-                f"[TransferEngine] block_ids size {block_ids.size} is less than "
-                f"indexer page_size {page_size}. No indexer pages to transfer."
+            flexkv_logger.info(
+                f"[TransferEngine][PageConvert] block_ids size {block_ids.size} < page_size {page_size}. "
+                f"No complete pages. Returning empty array. tail_size={tail_size}"
             )
             return np.array([], dtype=np.int64)
 
         if aligned_size != block_ids.size:
-            flexkv_logger.debug(
-                f"[TransferEngine] block_ids size {block_ids.size} is not a multiple "
-                f"of indexer page_size {page_size}. Truncating to {aligned_size} "
-                f"for indexer transfer ({aligned_size // page_size} pages)."
+            flexkv_logger.info(
+                f"[TransferEngine][PageConvert] Truncating: block_ids.size={block_ids.size} -> "
+                f"aligned_size={aligned_size} (dropped {tail_size} tail blocks). "
+                f"Pages: {aligned_size // page_size}. "
+                f"Dropped block_ids={block_ids[aligned_size:].tolist()}"
             )
             block_ids = block_ids[:aligned_size]
 
         reshaped = block_ids.reshape(-1, page_size)
         page_block_ids = reshaped[:, 0] // page_size
+
+        flexkv_logger.info(
+            f"[TransferEngine][PageConvert] Output: num_pages={page_block_ids.size}, "
+            f"page_block_ids={page_block_ids.tolist()}, "
+            f"first_block_per_page={reshaped[:, 0].tolist()}, "
+            f"last_block_per_page={reshaped[:, -1].tolist()}"
+        )
 
         return page_block_ids.astype(np.int64)
 
@@ -827,29 +884,68 @@ class TransferEngine:
                                                                        f"successors: {op.successors}",
                                                                        color=get_nvtx_range_color(op.graph_id))
         """Assign operation to appropriate worker"""
+        flexkv_logger.info(
+            f"[TransferEngine][AssignOp] === MainKV Op Details ==="
+            f" op_id={op.op_id}, graph_id={op.graph_id},"
+            f" transfer_type={op.transfer_type.name},"
+            f" src_block_ids.size={op.src_block_ids.size},"
+            f" dst_block_ids.size={op.dst_block_ids.size},"
+            f" src_block_ids[:8]={op.src_block_ids[:8].tolist() if op.src_block_ids.size > 0 else []},"
+            f" dst_block_ids[:8]={op.dst_block_ids[:8].tolist() if op.dst_block_ids.size > 0 else []},"
+            f" src_block_ids[-8:]={op.src_block_ids[-8:].tolist() if op.src_block_ids.size > 0 else []},"
+            f" dst_block_ids[-8:]={op.dst_block_ids[-8:].tolist() if op.dst_block_ids.size > 0 else []},"
+            f" layer_id={op.layer_id}, layer_granularity={op.layer_granularity},"
+            f" dp_id={op.dp_id}, pending_count={op.pending_count},"
+            f" valid_block_num={op.valid_block_num}"
+        )
         if op.transfer_type == TransferType.VIRTUAL:
+            flexkv_logger.info(f"[TransferEngine][AssignOp] op_id={op.op_id} is VIRTUAL, skipping.")
             return
         if op.transfer_type not in self._worker_map:
             raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
 
         if self._has_indexer and op.transfer_type in self._indexer_worker_map:
+            flexkv_logger.info(
+                f"[TransferEngine][AssignOp] op_id={op.op_id}: has_indexer=True, "
+                f"indexer_page_size={self._indexer_page_size}, "
+                f"transfer_type={op.transfer_type.name} is in indexer_worker_map"
+            )
             if self._indexer_page_size > 1:
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: Converting to page-level block_ids "
+                    f"(page_size={self._indexer_page_size})"
+                )
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: Converting SRC block_ids..."
+                )
                 src_page_ids = self._convert_to_page_level_block_ids(op.src_block_ids)
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: Converting DST block_ids..."
+                )
                 dst_page_ids = self._convert_to_page_level_block_ids(op.dst_block_ids)
+
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: Page conversion results: "
+                    f"src_page_ids={'None' if src_page_ids is None else f'size={src_page_ids.size}, ids={src_page_ids.tolist()}'}, "
+                    f"dst_page_ids={'None' if dst_page_ids is None else f'size={dst_page_ids.size}, ids={dst_page_ids.tolist()}'}"
+                )
 
                 if src_page_ids is not None and dst_page_ids is not None:
                     # Ensure both sides have the same number of pages after truncation
                     min_pages = min(src_page_ids.size, dst_page_ids.size)
                     if min_pages == 0:
-                        flexkv_logger.debug(
-                            f"[TransferEngine] No indexer pages to transfer for op {op.op_id} "
-                            f"after page-level alignment."
+                        flexkv_logger.info(
+                            f"[TransferEngine][AssignOp] op_id={op.op_id}: No indexer pages to transfer "
+                            f"after page-level alignment. src_pages={src_page_ids.size}, dst_pages={dst_page_ids.size}. "
+                            f"MainKV src_blocks={op.src_block_ids.size}, dst_blocks={op.dst_block_ids.size}. "
+                            f"Skipping indexer op creation."
                         )
                     elif src_page_ids.size != dst_page_ids.size:
                         flexkv_logger.warning(
-                            f"[TransferEngine] src_page_ids size {src_page_ids.size} != "
-                            f"dst_page_ids size {dst_page_ids.size} for op {op.op_id}. "
-                            f"Truncating both to {min_pages} pages."
+                            f"[TransferEngine][AssignOp] op_id={op.op_id}: src_page_ids.size={src_page_ids.size} != "
+                            f"dst_page_ids.size={dst_page_ids.size}. "
+                            f"Truncating both to {min_pages} pages. "
+                            f"Before truncation: src={src_page_ids.tolist()}, dst={dst_page_ids.tolist()}"
                         )
                         src_page_ids = src_page_ids[:min_pages]
                         dst_page_ids = dst_page_ids[:min_pages]
@@ -869,29 +965,71 @@ class TransferEngine:
                         self.op_id_to_op[indexer_op.op_id] = indexer_op
                         op.pending_count += 1
 
+                        flexkv_logger.info(
+                            f"[TransferEngine][AssignOp] === IndexerKV Op Created ==="
+                            f" indexer_op_id={indexer_op.op_id}, parent_op_id={op.op_id},"
+                            f" graph_id={indexer_op.graph_id},"
+                            f" transfer_type={indexer_op.transfer_type.name},"
+                            f" src_page_ids={src_page_ids.tolist()},"
+                            f" dst_page_ids={dst_page_ids.tolist()},"
+                            f" num_pages={min_pages},"
+                            f" layer_id={indexer_op.layer_id},"
+                            f" layer_granularity={indexer_op.layer_granularity},"
+                            f" dp_id={indexer_op.dp_id},"
+                            f" parent_pending_count={op.pending_count}"
+                        )
+
                         indexer_worker = self._indexer_worker_map[op.transfer_type]
                         if isinstance(indexer_worker, List):
                             indexer_worker[op.dp_id].submit_transfer(indexer_op)
                         else:
                             indexer_worker.submit_transfer(indexer_op)
+                        flexkv_logger.info(
+                            f"[TransferEngine][AssignOp] op_id={op.op_id}: Indexer op {indexer_op.op_id} submitted to worker."
+                        )
                 else:
                     flexkv_logger.warning(
-                        f"[TransferEngine] Skipping indexer transfer for op {op.op_id} "
-                        f"due to page-level block_ids conversion failure."
+                        f"[TransferEngine][AssignOp] op_id={op.op_id}: Skipping indexer transfer "
+                        f"due to page-level block_ids conversion failure. "
+                        f"src_page_ids={'None' if src_page_ids is None else f'size={src_page_ids.size}'}, "
+                        f"dst_page_ids={'None' if dst_page_ids is None else f'size={dst_page_ids.size}'}"
                     )
             else:
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: indexer_page_size=1, "
+                    f"using same block_ids for indexer (block-level). "
+                    f"src_blocks={op.src_block_ids.size}, dst_blocks={op.dst_block_ids.size}"
+                )
                 op.pending_count += 1
                 indexer_worker = self._indexer_worker_map[op.transfer_type]
                 if isinstance(indexer_worker, List):
                     indexer_worker[op.dp_id].submit_transfer(op)
                 else:
                     indexer_worker.submit_transfer(op)
+        else:
+            if self._has_indexer:
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: has_indexer=True but "
+                    f"transfer_type={op.transfer_type.name} NOT in indexer_worker_map. No indexer op."
+                )
+            else:
+                flexkv_logger.info(
+                    f"[TransferEngine][AssignOp] op_id={op.op_id}: has_indexer=False. No indexer op."
+                )
 
+        flexkv_logger.info(
+            f"[TransferEngine][AssignOp] op_id={op.op_id}: Submitting MainKV op to worker. "
+            f"transfer_type={op.transfer_type.name}, pending_count={op.pending_count}, "
+            f"src_blocks={op.src_block_ids.size}, dst_blocks={op.dst_block_ids.size}"
+        )
         worker = self._worker_map[op.transfer_type]
         if isinstance(worker, List):
             worker[op.dp_id].submit_transfer(op)
         else:
             worker.submit_transfer(op)
+        flexkv_logger.info(
+            f"[TransferEngine][AssignOp] op_id={op.op_id}: MainKV op submitted to worker."
+        )
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""

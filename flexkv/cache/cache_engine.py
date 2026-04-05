@@ -515,13 +515,37 @@ class GlobalCacheEngine:
             transfer_graph: The transfer operation graph
             operation: Operation type ("get" or "put")
         """
-        if self._metrics_collector is None:
-            return
+        # Always log detailed op info for debugging
+        op_count = len(transfer_graph._op_map)
+        flexkv_logger.info(
+            f"[CacheEngine][RecordOps] operation={operation}, graph_id={transfer_graph.graph_id}, "
+            f"total_ops={op_count}"
+        )
         for op in transfer_graph._op_map.values():
             if op.transfer_type != TransferType.VIRTUAL:
                 transfer_type_str = op.transfer_type.value
                 num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
-                self._metrics_collector.record_transfer(transfer_type_str, num_blocks, operation)
+                flexkv_logger.info(
+                    f"[CacheEngine][RecordOps] graph_id={transfer_graph.graph_id}, "
+                    f"op_id={op.op_id}, transfer_type={transfer_type_str}, "
+                    f"num_blocks={num_blocks}, "
+                    f"src_block_ids.size={op.src_block_ids.size if op.src_block_ids is not None else 'None'}, "
+                    f"dst_block_ids.size={op.dst_block_ids.size if op.dst_block_ids is not None else 'None'}, "
+                    f"src_block_ids[:8]={op.src_block_ids[:8].tolist() if op.src_block_ids is not None and op.src_block_ids.size > 0 else []}, "
+                    f"dst_block_ids[:8]={op.dst_block_ids[:8].tolist() if op.dst_block_ids is not None and op.dst_block_ids.size > 0 else []}, "
+                    f"src_block_ids[-8:]={op.src_block_ids[-8:].tolist() if op.src_block_ids is not None and op.src_block_ids.size > 0 else []}, "
+                    f"dst_block_ids[-8:]={op.dst_block_ids[-8:].tolist() if op.dst_block_ids is not None and op.dst_block_ids.size > 0 else []}, "
+                    f"layer_id={op.layer_id}, layer_granularity={op.layer_granularity}, "
+                    f"dp_id={op.dp_id}, predecessors={op.predecessors}, successors={op.successors}"
+                )
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_transfer(transfer_type_str, num_blocks, operation)
+            else:
+                flexkv_logger.info(
+                    f"[CacheEngine][RecordOps] graph_id={transfer_graph.graph_id}, "
+                    f"op_id={op.op_id}, transfer_type=VIRTUAL, "
+                    f"predecessors={op.predecessors}, successors={op.successors}"
+                )
 
     def get(self,
             request_id: int,
@@ -561,6 +585,18 @@ class GlobalCacheEngine:
         assert block_end_idx == aligned_length // self.tokens_per_block
         gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
+
+        flexkv_logger.info(
+            f"[CacheEngine][GET] request_id={request_id}, "
+            f"token_ids_len={token_ids.shape[0]}, aligned_length={aligned_length}, "
+            f"tokens_per_block={self.tokens_per_block}, "
+            f"block_start_idx={block_start_idx}, block_end_idx={block_end_idx}, "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"gpu_block_ids[:8]={gpu_block_ids[:8].tolist() if gpu_block_ids.size > 0 else []}, "
+            f"layer_num={layer_num}, layer_granularity={layer_granularity}, dp_id={dp_id}, "
+            f"enable_remote={self.cache_config.enable_remote}, "
+            f"ignore_remote={temp_cache_strategy.ignore_remote}"
+        )
 
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block,
@@ -623,10 +659,17 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
         
-        # Record metrics for GET operation
+        # Record transfer ops (always log, metrics only if collector exists)
+        self._record_transfer_ops(transfer_graph, "get")
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "get")
             self._update_mempool_metrics()
+
+        flexkv_logger.info(
+            f"[CacheEngine][GET] request_id={request_id} DONE: "
+            f"graph_id={transfer_graph.graph_id}, "
+            f"num_gpu_blocks_to_transfer={num_gpu_blocks_to_transfer}, "
+            f"task_end_op_id={task_end_op_id}"
+        )
         
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
@@ -671,6 +714,20 @@ class GlobalCacheEngine:
         if shared_pcfs_read:
             remote_file_nodeids = remote_matched_result.block_node_ids
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
+
+        flexkv_logger.info(
+            f"[CacheEngine][GetGlobal] request_id={request_id}, "
+            f"block_mask=[{block_mask_start}:{block_mask_end}], "
+            f"cpu_matched={len(cpu_matched_blocks)}(ready={cpu_matched_result.num_ready_matched_blocks}), "
+            f"ssd_matched={len(ssd_matched_blocks)}(ready={ssd_matched_result.num_ready_matched_blocks}), "
+            f"remote_matched={len(remote_matched_blocks)}(ready={remote_matched_result.num_ready_matched_blocks}), "
+            f"fragment123_num_blocks={fragment123_num_blocks}, "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"cpu_blocks[:8]={cpu_matched_blocks[:8].tolist() if len(cpu_matched_blocks) > 0 else []}, "
+            f"ssd_blocks[:8]={ssd_matched_blocks[:8].tolist() if len(ssd_matched_blocks) > 0 else []}, "
+            f"remote_blocks[:8]={remote_matched_blocks[:8].tolist() if len(remote_matched_blocks) > 0 else []}"
+        )
+
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
             # All cache levels missed - record miss for all requested blocks
@@ -694,6 +751,17 @@ class GlobalCacheEngine:
         fragment123_cpu_blocks = cpu_matched_blocks
         fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
         fragment3_remote_blocks = remote_matched_blocks[-fragment3_num_blocks:]
+
+        flexkv_logger.info(
+            f"[CacheEngine][GetGlobal] request_id={request_id}: fragments: "
+            f"f1={fragment1_num_blocks}(cpu), f2={fragment2_num_blocks}(ssd->cpu), "
+            f"f3={fragment3_num_blocks}(remote->cpu), f12={fragment12_num_blocks}, f23={fragment23_num_blocks}, "
+            f"gpu_blocks[:8]={fragment123_gpu_blocks[:8].tolist() if fragment123_gpu_blocks.size > 0 else []}, "
+            f"cpu_blocks[:8]={fragment123_cpu_blocks[:8].tolist() if len(fragment123_cpu_blocks) > 0 else []}, "
+            f"ssd_blocks[:8]={fragment2_ssd_blocks[:8].tolist() if len(fragment2_ssd_blocks) > 0 else []}, "
+            f"remote_blocks[:8]={fragment3_remote_blocks[:8].tolist() if len(fragment3_remote_blocks) > 0 else []}"
+        )
+
         fragment3_remote_file_nodeids = None
         if shared_pcfs_read:
             fragment3_remote_file_nodeids = remote_file_nodeids[-fragment3_num_blocks:]
@@ -887,6 +955,19 @@ class GlobalCacheEngine:
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
         fragment1_num_blocks = len(cpu_matched_blocks)
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
+
+        flexkv_logger.info(
+            f"[CacheEngine][GetLocal] request_id={request_id}, "
+            f"block_mask=[{block_mask_start}:{block_mask_end}], "
+            f"cpu_matched={len(cpu_matched_blocks)}(ready={cpu_matched_result.num_ready_matched_blocks}, pos={cpu_matched_result.matched_pos}), "
+            f"ssd_matched={len(ssd_matched_blocks)}(ready={ssd_matched_result.num_ready_matched_blocks}, pos={ssd_matched_result.matched_pos}), "
+            f"fragment12={fragment12_num_blocks}, f1={fragment1_num_blocks}, f2={fragment2_num_blocks}, "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"enable_gpu={enable_gpu}, enable_ssd={enable_ssd}, enable_gds={enable_gds}, "
+            f"cpu_blocks[:8]={cpu_matched_blocks[:8].tolist() if len(cpu_matched_blocks) > 0 else []}, "
+            f"ssd_blocks[:8]={ssd_matched_blocks[:8].tolist() if len(ssd_matched_blocks) > 0 else []}"
+        )
+
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
             # All cache levels missed - record miss for all requested blocks
@@ -1084,6 +1165,18 @@ class GlobalCacheEngine:
         gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
+        flexkv_logger.info(
+            f"[CacheEngine][PUT] request_id={request_id}, "
+            f"token_ids_len={token_ids.shape[0]}, aligned_length={aligned_length}, "
+            f"tokens_per_block={self.tokens_per_block}, "
+            f"block_start_idx={block_start_idx}, block_end_idx={block_end_idx}, "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"gpu_block_ids[:8]={gpu_block_ids[:8].tolist() if gpu_block_ids.size > 0 else []}, "
+            f"layer_num={layer_num}, dp_id={dp_id}, "
+            f"enable_remote={self.cache_config.enable_remote}, "
+            f"ignore_remote={temp_cache_strategy.ignore_remote}"
+        )
+
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
@@ -1139,10 +1232,18 @@ class GlobalCacheEngine:
                                               node_to_ready=op_node_to_ready[op_id][1],
                                               ready_length=op_node_to_ready[op_id][2])
 
-        # Record metrics for PUT operation
+        # Record transfer ops (always log, metrics only if collector exists)
+        self._record_transfer_ops(transfer_graph, "put")
         if self._metrics_collector is not None:
-            self._record_transfer_ops(transfer_graph, "put")
             self._update_mempool_metrics()
+
+        flexkv_logger.info(
+            f"[CacheEngine][PUT] request_id={request_id} DONE: "
+            f"graph_id={transfer_graph.graph_id}, "
+            f"num_gpu_blocks_to_transfer={num_gpu_blocks_to_transfer}, "
+            f"skipped_gpu_blocks={skipped_gpu_blocks}, "
+            f"task_end_op_id={task_end_op_id}"
+        )
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
@@ -1195,6 +1296,20 @@ class GlobalCacheEngine:
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
+
+        flexkv_logger.info(
+            f"[CacheEngine][PutGlobal] request_id={request_id}, "
+            f"block_mask=[{block_mask_start}:{block_mask_end}], "
+            f"cpu_matched={len(cpu_matched_blocks)}(total={cpu_matched_result.num_matched_blocks}), "
+            f"ssd_matched={len(ssd_matched_blocks)}(total={ssd_matched_result.num_matched_blocks}), "
+            f"remote_matched={len(remote_matched_blocks)}(total={remote_matched_result.num_matched_blocks}), "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"num_skipped_blocks={num_skipped_blocks}, fragment12_num_blocks={fragment12_num_blocks}, "
+            f"cpu_blocks[:8]={cpu_matched_blocks[:8].tolist() if len(cpu_matched_blocks) > 0 else []}, "
+            f"ssd_blocks[:8]={ssd_matched_blocks[:8].tolist() if len(ssd_matched_blocks) > 0 else []}, "
+            f"remote_blocks[:8]={remote_matched_blocks[:8].tolist() if len(remote_matched_blocks) > 0 else []}"
+        )
+
         if fragment12_num_blocks == 0:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
@@ -1367,6 +1482,19 @@ class GlobalCacheEngine:
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
+
+        flexkv_logger.info(
+            f"[CacheEngine][PutLocal] request_id={request_id}, "
+            f"block_mask=[{block_mask_start}:{block_mask_end}], "
+            f"cpu_matched={len(cpu_matched_blocks)}(total={cpu_matched_result.num_matched_blocks}), "
+            f"ssd_matched={len(ssd_matched_blocks)}(total={ssd_matched_result.num_matched_blocks}), "
+            f"gpu_block_ids.size={gpu_block_ids.size}, "
+            f"num_skipped_blocks={num_skipped_blocks}, fragment12_num_blocks={fragment12_num_blocks}, "
+            f"enable_ssd={enable_ssd}, enable_gds={enable_gds}, "
+            f"cpu_blocks[:8]={cpu_matched_blocks[:8].tolist() if len(cpu_matched_blocks) > 0 else []}, "
+            f"ssd_blocks[:8]={ssd_matched_blocks[:8].tolist() if len(ssd_matched_blocks) > 0 else []}"
+        )
+
         if fragment12_num_blocks == 0:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
