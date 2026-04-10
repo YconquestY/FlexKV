@@ -929,6 +929,7 @@ class TransferEngine:
                    self.model_config.nsa_prefill_cp:
                     if indexer_op.transfer_type == TransferType.H2D:
                         op.pending_count += self.model_config.cp_size - 1
+                        indexer_op.pending_count += self.model_config.cp_size - 1
                         for cp_rank in range(self.model_config.cp_size):
                             indexer_worker[op.dp_id * self.model_config.cp_size + cp_rank].submit_transfer(indexer_op)
                     else:
