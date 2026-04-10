@@ -117,6 +117,7 @@ class FlexKVConfig:
         pp_rank: int = 0,
         dp_size: int = 1,
         dp_rank: int = 0,
+        nsa_prefill_cp: bool = False
     ):
         """
         Initialize FlexKVConfig fields from sglang config.
@@ -130,6 +131,8 @@ class FlexKVConfig:
             pp_rank: pipeline parallel rank (default 0)
             dp_size: data parallel size (default 1, no DP)
             dp_rank: data parallel rank (default 0)
+            nsa_prefill_cp: whether sglang adopts context parallelism for the prefill side of the NSA attention backend
+                Specified by --enable-nsa-prefill-context-parallel for DeepSeek-V3.2 and GLM-5
         """
         # cache config: use page_size as tokens_per_block so that FlexKV's
         # CPU radix tree manages blocks at page granularity, ensuring that
@@ -170,6 +173,7 @@ class FlexKVConfig:
         self.model_config.dp_rank = int(dp_rank if dp_rank is not None else 0)
         self.model_config.pp_size = int(pp_size)
         self.model_config.pp_rank = int(pp_rank)
+        self.model_config.nsa_prefill_cp = bool(nsa_prefill_cp)
         update_default_config_from_user_config(self.model_config, self.cache_config, self.user_config)
 
         # Each PP rank needs its own IPC ports so that their

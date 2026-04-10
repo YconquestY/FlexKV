@@ -268,7 +268,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                             f"{len(metadata)} bytes")
                         continue
 
-                    tp_rank, _, recv_num_layers, recv_num_counters = struct.unpack("iiii", metadata)
+                    tp_rank, _, cp_rank, _, recv_num_layers, recv_num_counters = struct.unpack("iiiiii", metadata)
                     if conn_idx == 0:
                         num_layers, num_counters = recv_num_layers, recv_num_counters
 

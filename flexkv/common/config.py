@@ -36,6 +36,7 @@ class ModelConfig:
     dp_rank: int = 0
     pp_size: int = 1
     pp_rank: int = 0
+    nsa_prefill_cp: bool = False
 
     @property
     def token_size_in_bytes(self) -> int:
