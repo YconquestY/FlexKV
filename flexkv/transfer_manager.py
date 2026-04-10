@@ -88,7 +88,7 @@ class TransferManager:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}, "
                                f"expected {self.expected_gpus} GPUs to register "
                                f"(instance_num={self.instance_num}, "
-                               f"cp={self.model_config.cp_size}, " if self.model_config.cp_size > 1 else f"tp={self.model_config.tp_size}, "
+                               f"{f'cp={self.model_config.cp_size}, ' if self.model_config.cp_size > 1 else f'tp={self.model_config.tp_size}, '}"
                                f"dp={self.model_config.dp_size})")
             last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
