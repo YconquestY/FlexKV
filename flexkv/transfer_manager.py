@@ -44,7 +44,7 @@ class TransferManager:
         
         # Calculate total expected GPUs across all instances
         self.expected_gpus = self.instance_num * \
-                             self.model_config.cp_size if model_config.cp_size > 1 else model_config.tp_size * \
+                             (self.model_config.cp_size if model_config.cp_size > 1 else model_config.tp_size) * \
                              model_config.dp_size
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks

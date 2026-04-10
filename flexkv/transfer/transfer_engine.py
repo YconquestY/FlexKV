@@ -220,18 +220,18 @@ class TransferEngine:
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handle.get_tensor_handle_list(),
+                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
                     cpu_blocks=self._cpu_handle.get_tensor(),
                     gpu_kv_layout=gpu_handles[0].kv_layout, # Assume uniform
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype, # Assume uniform
-                    gpu_device_id=gpu_handle.gpu_device_id,
+                    gpu_device_id=gpu_handles[0].gpu_device_id,
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                 )
-                for _, gpu_handles in self.gpu_handle_groups.items() for gpu_handle in gpu_handles
+                for _, gpu_handles in self.gpu_handle_groups.items()
             ]
         else:
             self.h2d_workers = [
@@ -467,15 +467,15 @@ class TransferEngine:
                 ]
             elif self.cp_size > 1: # WARN: Not sure about CP's impact on multi-instancing
                 # CP: 1 DP group, reuse DP transfer workers
-                self.h2d_workers: List[WorkerHandle] = [
+                self._indexer_h2d_workers: List[WorkerHandle] = [
                     GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self._indexer_finished_ops_queue,
                         op_buffer_tensor=self.pin_buffer.get_buffer(),
                         gpu_blocks=indexer_gpu_handle.get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
+                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
                         gpu_kv_layout=indexer_gpu_handles_list[0].kv_layout, # Assume uniform
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
                         dtype=indexer_gpu_handles_list[0].dtype, # Assume uniform
                         gpu_device_id=indexer_gpu_handle.gpu_device_id,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
@@ -486,24 +486,23 @@ class TransferEngine:
                     for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items() \
                         for indexer_gpu_handle in indexer_gpu_handles_list
                 ]
-                self.d2h_workers: List[WorkerHandle] = [
+                self._indexer_d2h_workers: List[WorkerHandle] = [
                     GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self._indexer_finished_ops_queue,
                         op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=indexer_gpu_handle.get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_tensor(),
+                        gpu_blocks=indexer_gpu_handles_list[0].get_tensor_handle_list(),
+                        cpu_blocks=self._indexer_cpu_handle.get_tensor(),
                         gpu_kv_layout=indexer_gpu_handles_list[0].kv_layout, # Assume uniform
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
                         dtype=indexer_gpu_handles_list[0].dtype, # Assume uniform
-                        gpu_device_id=indexer_gpu_handle.gpu_device_id,
+                        gpu_device_id=indexer_gpu_handles_list[0].gpu_device_id,
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     )
-                    for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items() \
-                        for indexer_gpu_handle in indexer_gpu_handles_list
+                    for _, indexer_gpu_handles_list in self._indexer_gpu_handles.items()
                 ]
             else:
                 self._indexer_h2d_workers = [
@@ -920,7 +919,19 @@ class TransferEngine:
                 )
 
                 indexer_worker = self._indexer_worker_map[op.transfer_type]
-                if isinstance(indexer_worker, List):
+                if isinstance(indexer_worker, List) and \
+                   self.model_config.cp_size > 1 and \
+                   self.model_config.nsa_prefill_cp:
+                    if indexer_op.transfer_type == TransferType.H2D:
+                        op.pending_count += self.model_config.cp_size - 1
+                        for cp_rank in range(self.model_config.cp_size):
+                            indexer_worker[op.dp_id * self.model_config.cp_size + cp_rank].submit_transfer(indexer_op)
+                    else:
+                        indexer_worker[op.dp_id].submit_transfer(indexer_op)
+                elif isinstance(indexer_worker, List) and \
+                     self.model_config.cp_size > 1:
+                    raise NotImplementedError("Only supports SGLang NSA prefill CP")
+                elif isinstance(indexer_worker, List):
                     indexer_worker[op.dp_id].submit_transfer(indexer_op)
                 else:
                     indexer_worker.submit_transfer(indexer_op)
@@ -931,6 +942,7 @@ class TransferEngine:
            self.model_config.nsa_prefill_cp:
             # NOTE: SGLang NSA prefill CP for DeepSeek-V3.2 and GLM-5 introduces duplicate KV caches.
             if op.transfer_type == TransferType.H2D:
+                op.pending_count += self.model_config.cp_size - 1
                 for cp_rank in range(self.model_config.cp_size):
                     worker[op.dp_id * self.model_config.cp_size + cp_rank].submit_transfer(op)
             else:

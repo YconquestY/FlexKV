@@ -261,8 +261,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                     break
 
                 with conn:
-                    metadata = conn.recv(16)
-                    if len(metadata) < 16:
+                    metadata = conn.recv(24)
+                    if len(metadata) < 24:
                         flexkv_logger.error(
                             f"[LayerwiseWorker] Incomplete metadata on {socket_path}{rank_label}: "
                             f"{len(metadata)} bytes")
