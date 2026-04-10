@@ -864,7 +864,12 @@ class TransferEngine:
         """
         free_op_from_buffer(op, self.pin_buffer)
         # Compute transfer metrics for this completed op
-        num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
+        if self.model_config.cp_size > 1 and \
+           self.model_config.nsa_prefill_cp and \
+           op.transfer_type == TransferType.H2D:
+            num_blocks = (len(op.src_block_ids) if op.src_block_ids is not None else 0) * self.model_config.cp_size
+        else:
+            num_blocks = len(op.src_block_ids) if op.src_block_ids is not None else 0
         num_bytes = num_blocks * self.cache_config.tokens_per_block * self.model_config.token_size_in_bytes
         transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
         self.completed_queue.put(CompletedOp(
